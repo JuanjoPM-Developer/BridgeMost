@@ -178,7 +178,7 @@ curl http://localhost:9191/health
 ```json
 {
   "status": "ok",
-  "version": "0.5.0",
+  "version": "0.8.2",
   "transport": "websocket",
   "uptime": "2h15m30s",
   "uptime_seconds": 8130,
