@@ -42,7 +42,21 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-### Configuration
+### Configuration (Automatic — Recommended)
+
+```bash
+python3 -m teleghost setup
+```
+
+The interactive wizard will:
+1. Connect to your Mattermost server
+2. Log in with your credentials (password not stored)
+3. Auto-create a Personal Access Token
+4. List all bots — select which ones to bridge
+5. Ask for your Telegram bot token and user ID
+6. Generate `config.yaml` automatically
+
+### Configuration (Manual)
 
 ```bash
 cp config.example.yaml config.yaml
@@ -206,6 +220,7 @@ TeleGhost validates everything before accepting messages:
 
 | Version | Feature |
 |---------|---------|
+| v0.6.0 | Interactive setup wizard (`teleghost setup`) |
 | v0.5.0 | Startup resilience — token validation, DM retry, zero-channel abort |
 | v0.4.0 | Voice-to-text transcription via Whisper API |
 | v0.3.1 | Synthetic typing indicator |

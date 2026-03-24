@@ -25,12 +25,19 @@ def setup_logging(level: str, log_file: str = ""):
 
 def main():
     """Main entry point."""
+    # Handle `teleghost setup` command
+    if len(sys.argv) > 1 and sys.argv[1] == "setup":
+        from .setup import main as setup_main
+        setup_main()
+        return
+
     config_path = sys.argv[1] if len(sys.argv) > 1 else None
 
     try:
         config = load_config(config_path)
     except FileNotFoundError as e:
         print(f"ERROR: {e}", file=sys.stderr)
+        print("Tip: Run 'python -m teleghost setup' to create config.yaml interactively.")
         sys.exit(1)
 
     setup_logging(config.log_level, config.log_file)
