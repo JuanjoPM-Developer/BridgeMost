@@ -653,6 +653,81 @@ class BridgeMostBridge:
                 if fid:
                     file_ids.append(fid)
 
+            elif msg.sticker:
+                # Convert sticker to image and upload to MM
+                sticker = msg.sticker
+                emoji_hint = sticker.emoji or ""
+                try:
+                    tg_file = await context.bot.get_file(sticker.file_id)
+                    # Animated/video stickers are .tgs/.webm — send as file
+                    # Static stickers are .webp — convert to png
+                    if sticker.is_animated:
+                        suffix, fname = ".tgs", "sticker.tgs"
+                    elif sticker.is_video:
+                        suffix, fname = ".webm", "sticker.webm"
+                    else:
+                        suffix, fname = ".webp", "sticker.webp"
+                    local_file = tempfile.NamedTemporaryFile(
+                        suffix=suffix, delete=False
+                    )
+                    await tg_file.download_to_drive(local_file.name)
+                    fid = await self.mm.upload_file(
+                        user.mm_token, dm_channel,
+                        local_file.name, fname
+                    )
+                    if fid:
+                        file_ids.append(fid)
+                    # Add emoji as text hint if present
+                    if emoji_hint and not text:
+                        text = emoji_hint
+                except Exception as e:
+                    # Fallback: send sticker emoji as text
+                    if emoji_hint:
+                        text = emoji_hint
+                    logger.warning("Sticker download failed: %s", e)
+
+            elif msg.location:
+                # Convert location to text with map link
+                lat = msg.location.latitude
+                lon = msg.location.longitude
+                map_url = f"https://www.google.com/maps?q={lat},{lon}"
+                loc_text = f"📍 Ubicación: [{lat}, {lon}]({map_url})"
+                if not text:
+                    text = loc_text
+                else:
+                    text = f"{text}\n{loc_text}"
+
+            elif msg.venue:
+                # Venue = location + name/address
+                lat = msg.venue.location.latitude
+                lon = msg.venue.location.longitude
+                map_url = f"https://www.google.com/maps?q={lat},{lon}"
+                venue_name = msg.venue.title or "Venue"
+                venue_addr = msg.venue.address or ""
+                loc_text = f"📍 {venue_name}"
+                if venue_addr:
+                    loc_text += f" — {venue_addr}"
+                loc_text += f"\n[Ver en mapa]({map_url})"
+                if not text:
+                    text = loc_text
+                else:
+                    text = f"{text}\n{loc_text}"
+
+            elif msg.poll:
+                # Convert TG poll to formatted text in MM
+                poll = msg.poll
+                poll_text = f"📊 **{poll.question}**\n"
+                for i, opt in enumerate(poll.options):
+                    poll_text += f"  {i+1}. {opt.text}\n"
+                if poll.is_anonymous:
+                    poll_text += "_Encuesta anónima_"
+                if poll.allows_multiple_answers:
+                    poll_text += " · _Múltiple respuesta_"
+                if not text:
+                    text = poll_text
+                else:
+                    text = f"{text}\n{poll_text}"
+
             # Voice-to-text: transcribe BEFORE file cleanup
             if self.whisper and msg.voice and local_file:
                 try:
