@@ -144,6 +144,36 @@ class MattermostClient:
             logger.error("MM delete failed (%d): %s", resp.status, data)
             return False
 
+    async def add_reaction(self, token: str, user_id: str, post_id: str, emoji_name: str) -> bool:
+        """Add a reaction to a post."""
+        session = await self._get_session()
+        payload = {"user_id": user_id, "post_id": post_id, "emoji_name": emoji_name}
+        async with session.post(
+            f"{self.base_url}/api/v4/reactions",
+            json=payload,
+            headers=self._headers(token),
+        ) as resp:
+            if resp.status in (200, 201):
+                logger.debug("MM reaction added: %s on %s", emoji_name, post_id[:8])
+                return True
+            data = await resp.json()
+            logger.error("MM add_reaction failed (%d): %s", resp.status, data)
+            return False
+
+    async def remove_reaction(self, token: str, user_id: str, post_id: str, emoji_name: str) -> bool:
+        """Remove a reaction from a post."""
+        session = await self._get_session()
+        async with session.delete(
+            f"{self.base_url}/api/v4/reactions/{user_id}/{post_id}/{emoji_name}",
+            headers=self._headers(token),
+        ) as resp:
+            if resp.status == 200:
+                logger.debug("MM reaction removed: %s on %s", emoji_name, post_id[:8])
+                return True
+            data = await resp.json()
+            logger.error("MM remove_reaction failed (%d): %s", resp.status, data)
+            return False
+
     async def download_file(self, token: str, file_id: str, dest: str) -> str:
         """Download a file from MM to local path."""
         session = await self._get_session()

@@ -147,8 +147,8 @@ curl http://localhost:9191/health
 - [x] Multi-bot routing (`/bot` command)
 - [x] Edit/delete synchronization
 - [x] WebSocket for MM (replace polling)
-- [ ] Reactions relay
-- [ ] Multi-user support (multiple TG users)
+- [x] Reactions relay
+ (multiple TG users)
 
 ## 🛡️ Security
 

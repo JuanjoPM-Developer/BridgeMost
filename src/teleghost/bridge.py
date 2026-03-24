@@ -17,6 +17,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from .config import Config, UserMapping
+from .emoji import tg_emoji_to_mm, mm_emoji_to_tg
 from .health import HealthServer
 from .markdown import mm_to_telegram
 from .mattermost import MattermostClient
@@ -144,6 +145,10 @@ class TeleGhostBridge:
             self._handle_telegram_edit,
         ))
 
+        # Handle reactions (TG sends MessageReactionUpdated)
+        from telegram.ext import MessageReactionHandler
+        app.add_handler(MessageReactionHandler(self._handle_telegram_reaction))
+
         # Start TG polling in background
         await app.initialize()
         await app.start()
@@ -168,6 +173,8 @@ class TeleGhostBridge:
             on_post=self._handle_ws_post,
             on_post_edited=self._handle_ws_edit,
             on_post_deleted=self._handle_ws_delete,
+            on_reaction_added=self._handle_ws_reaction_added,
+            on_reaction_removed=self._handle_ws_reaction_removed,
         )
         await self._ws.start()
 
@@ -534,6 +541,124 @@ class TeleGhostBridge:
         # Cleanup mapping
         self._mm_to_tg.pop(post_id, None)
         self._tg_to_mm.pop(tg_msg_id, None)
+
+    async def _handle_telegram_reaction(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle TG reaction → add/remove reaction on MM post."""
+        reaction_update = update.message_reaction
+        if not reaction_update:
+            return
+
+        tg_user_id = reaction_update.user.id if reaction_update.user else None
+        if not tg_user_id:
+            return
+
+        user = self.config.get_user_by_tg_id(tg_user_id)
+        if not user:
+            return
+
+        msg_id = reaction_update.message_id
+        mm_post_id = self._tg_to_mm.get(msg_id)
+        if not mm_post_id:
+            logger.debug("TG reaction on unmapped msg %d, ignoring", msg_id)
+            return
+
+        # Determine added/removed reactions by comparing old vs new
+        old_emojis = set()
+        for r in (reaction_update.old_reaction or []):
+            if hasattr(r, "emoji") and r.emoji:
+                old_emojis.add(r.emoji)
+
+        new_emojis = set()
+        for r in (reaction_update.new_reaction or []):
+            if hasattr(r, "emoji") and r.emoji:
+                new_emojis.add(r.emoji)
+
+        added = new_emojis - old_emojis
+        removed = old_emojis - new_emojis
+
+        for emoji in added:
+            mm_name = tg_emoji_to_mm(emoji)
+            if mm_name:
+                logger.info("TG→MM reaction [%s]: %s on %s", user.telegram_name, mm_name, mm_post_id[:8])
+                await self.mm.add_reaction(user.mm_token, user.mm_user_id, mm_post_id, mm_name)
+
+        for emoji in removed:
+            mm_name = tg_emoji_to_mm(emoji)
+            if mm_name:
+                logger.info("TG→MM unreaction [%s]: %s on %s", user.telegram_name, mm_name, mm_post_id[:8])
+                await self.mm.remove_reaction(user.mm_token, user.mm_user_id, mm_post_id, mm_name)
+
+    async def _handle_ws_reaction_added(self, reaction: dict):
+        """Handle MM reaction_added → set reaction on TG message."""
+        post_id = reaction.get("post_id", "")
+        user_id = reaction.get("user_id", "")
+        emoji_name = reaction.get("emoji_name", "")
+
+        if not post_id or not emoji_name:
+            return
+
+        tg_msg_id = self._mm_to_tg.get(post_id)
+        if not tg_msg_id:
+            return
+
+        # Find user by checking all DM channels for the post
+        target_user = None
+        for ch_id, (usr, bot) in self._dm_to_user.items():
+            if user_id != usr.mm_user_id:
+                target_user = usr
+                break
+
+        if not target_user:
+            return
+
+        tg_emoji = mm_emoji_to_tg(emoji_name)
+        if not tg_emoji:
+            logger.debug("No TG emoji for MM :%s:, skipping", emoji_name)
+            return
+
+        logger.info("WS→TG reaction [%s]: %s on msg %d", target_user.telegram_name, tg_emoji, tg_msg_id)
+        try:
+            await self._tg_bot.set_message_reaction(
+                chat_id=target_user.telegram_id,
+                message_id=tg_msg_id,
+                reaction=[{"type": "emoji", "emoji": tg_emoji}],
+            )
+        except Exception as e:
+            logger.error("TG set_reaction error: %s", e)
+
+    async def _handle_ws_reaction_removed(self, reaction: dict):
+        """Handle MM reaction_removed → clear reaction on TG message."""
+        post_id = reaction.get("post_id", "")
+        user_id = reaction.get("user_id", "")
+
+        if not post_id:
+            return
+
+        tg_msg_id = self._mm_to_tg.get(post_id)
+        if not tg_msg_id:
+            return
+
+        target_user = None
+        for ch_id, (usr, bot) in self._dm_to_user.items():
+            if user_id != usr.mm_user_id:
+                target_user = usr
+                break
+
+        if not target_user:
+            return
+
+        logger.info("WS→TG unreaction [%s]: on msg %d", target_user.telegram_name, tg_msg_id)
+        try:
+            # Empty reaction list clears all reactions
+            await self._tg_bot.set_message_reaction(
+                chat_id=target_user.telegram_id,
+                message_id=tg_msg_id,
+                reaction=[],
+            )
+        except Exception as e:
+            logger.error("TG clear_reaction error: %s", e)
 
     async def _retry_mm_post(
         self, user: UserMapping, channel_id: str, text: str,

@@ -13,6 +13,8 @@ logger = logging.getLogger("teleghost.ws")
 EVENT_POSTED = "posted"
 EVENT_POST_EDITED = "post_edited"
 EVENT_POST_DELETED = "post_deleted"
+EVENT_REACTION_ADDED = "reaction_added"
+EVENT_REACTION_REMOVED = "reaction_removed"
 
 
 class MattermostWebSocket:
@@ -29,6 +31,8 @@ class MattermostWebSocket:
         on_post: Callable[[dict], Awaitable[None]],
         on_post_edited: Callable[[dict], Awaitable[None]] | None = None,
         on_post_deleted: Callable[[dict], Awaitable[None]] | None = None,
+        on_reaction_added: Callable[[dict], Awaitable[None]] | None = None,
+        on_reaction_removed: Callable[[dict], Awaitable[None]] | None = None,
         reconnect_base: float = 2.0,
         reconnect_max: float = 60.0,
     ):
@@ -37,6 +41,8 @@ class MattermostWebSocket:
         self.on_post = on_post
         self.on_post_edited = on_post_edited
         self.on_post_deleted = on_post_deleted
+        self.on_reaction_added = on_reaction_added
+        self.on_reaction_removed = on_reaction_removed
         self._reconnect_base = reconnect_base
         self._reconnect_max = reconnect_max
         self._seq = 1
@@ -203,3 +209,31 @@ class MattermostWebSocket:
                         await self.on_post_deleted(post)
                     except Exception as e:
                         logger.error("Error handling post_deleted event: %s", e, exc_info=True)
+
+        elif event == EVENT_REACTION_ADDED:
+            if self.on_reaction_added:
+                reaction = data.get("data", {}).get("reaction", "")
+                if isinstance(reaction, str):
+                    try:
+                        reaction = json.loads(reaction)
+                    except json.JSONDecodeError:
+                        return
+                if reaction:
+                    try:
+                        await self.on_reaction_added(reaction)
+                    except Exception as e:
+                        logger.error("Error handling reaction_added: %s", e, exc_info=True)
+
+        elif event == EVENT_REACTION_REMOVED:
+            if self.on_reaction_removed:
+                reaction = data.get("data", {}).get("reaction", "")
+                if isinstance(reaction, str):
+                    try:
+                        reaction = json.loads(reaction)
+                    except json.JSONDecodeError:
+                        return
+                if reaction:
+                    try:
+                        await self.on_reaction_removed(reaction)
+                    except Exception as e:
+                        logger.error("Error handling reaction_removed: %s", e, exc_info=True)
