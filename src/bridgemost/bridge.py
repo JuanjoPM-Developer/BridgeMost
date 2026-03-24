@@ -260,8 +260,6 @@ class BridgeMostBridge:
         app.add_handler(CommandHandler("bots", self._handle_bots_command))
         # /status — detailed info about active bot
         app.add_handler(CommandHandler("status", self._handle_status_command))
-        # /ping — measure round-trip latency
-        app.add_handler(CommandHandler("ping", self._handle_ping_command))
 
         # Handle ALL messages (text, photos, documents, etc.)
         app.add_handler(MessageHandler(
@@ -373,7 +371,7 @@ class BridgeMostBridge:
                 return bot
         return user.bots[0] if user.bots else None
 
-    async def _typing_loop(self, tg_user_id: int, max_duration: float = 300.0):
+    async def _typing_loop(self, tg_user_id: int, max_duration: float = 60.0):
         """Send 'typing' chat action every 4s until cancelled or timeout.
 
         Telegram typing indicator lasts ~5s, so 4s refresh keeps it alive.
