@@ -1,3 +1,3 @@
 """BridgeMost - Telegram ↔ Mattermost transparent bridge."""
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"
