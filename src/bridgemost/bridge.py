@@ -104,7 +104,8 @@ class BridgeMostBridge:
 
     async def start(self):
         """Start the bridge."""
-        logger.info("BridgeMost v0.6.0 starting (WebSocket + multi-bot + setup wizard)...")
+        from . import __version__
+        logger.info("BridgeMost v%s starting (WebSocket + multi-bot + setup wizard)...", __version__)
 
         # Phase 1: Pre-validate all user tokens before anything else
         for user in self.config.users:
@@ -251,11 +252,34 @@ class BridgeMostBridge:
 
         logger.info("BridgeMost bridge active — WebSocket + Telegram listening")
 
-        # Keep running until interrupted
+        # Keep running with periodic PAT health check
         self._running = True
+        pat_check_interval = 300  # 5 minutes
+        pat_check_counter = 0
         try:
             while self._running:
                 await asyncio.sleep(1)
+                pat_check_counter += 1
+                if pat_check_counter >= pat_check_interval:
+                    pat_check_counter = 0
+                    for user in self.config.users:
+                        info = await self.mm.validate_token(user.mm_token)
+                        if not info:
+                            logger.error(
+                                "PAT EXPIRED for %s — bridge will fail on next TG→MM relay! "
+                                "Check EnableUserAccessTokens and token validity.",
+                                user.telegram_name,
+                            )
+                            self.health.record_error()
+                            # Notify user via Telegram
+                            try:
+                                if self._tg_bot:
+                                    await self._tg_bot.send_message(
+                                        chat_id=user.telegram_id,
+                                        text="⚠️ BridgeMost: Tu token de Mattermost ha expirado. Los mensajes no llegarán hasta que se renueve.",
+                                    )
+                            except Exception:
+                                pass
         finally:
             self._running = False
             if self._ws:
@@ -283,20 +307,25 @@ class BridgeMostBridge:
                 return bot
         return user.bots[0] if user.bots else None
 
-    async def _typing_loop(self, tg_user_id: int):
-        """Send 'typing' chat action every 4s until cancelled.
+    async def _typing_loop(self, tg_user_id: int, max_duration: float = 300.0):
+        """Send 'typing' chat action every 4s until cancelled or timeout.
 
         Telegram typing indicator lasts ~5s, so 4s refresh keeps it alive.
         This runs after we post a user message to MM, and stops when the
-        bot's response arrives via WebSocket.
+        bot's response arrives via WebSocket. Safety timeout prevents
+        infinite typing if the bot never responds (crash, 401, etc.).
         """
         try:
-            while True:
+            elapsed = 0.0
+            interval = 4.0
+            while elapsed < max_duration:
                 await self._tg_bot.send_chat_action(
                     chat_id=tg_user_id,
                     action="typing",
                 )
-                await asyncio.sleep(4)
+                await asyncio.sleep(interval)
+                elapsed += interval
+            logger.warning("Typing timeout (%ds) for user %d — bot may be stuck", int(max_duration), tg_user_id)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -391,6 +420,7 @@ class BridgeMostBridge:
         self.health.record_tg_to_mm()
 
         file_ids = []
+        voice_prefix = ""  # Set by Whisper transcription if voice message
 
         # Handle media (photo, document, audio, video, voice, sticker)
         local_file = None
@@ -433,15 +463,6 @@ class BridgeMostBridge:
                 await tg_file.download_to_drive(local_file.name)
                 fname = getattr(audio, "file_name", None) or f"audio{suffix}"
 
-                # Voice-to-text: transcribe if Whisper is configured
-                if self.whisper and msg.voice:
-                    transcript = await self.whisper.transcribe(local_file.name)
-                    if transcript:
-                        # Prepend transcription to message text
-                        voice_text = f"🎤 {transcript}"
-                        text = f"{voice_text}\n{text}" if text else voice_text
-                        logger.info("Voice transcribed: %s", transcript[:80])
-
                 # Upload audio file (always if keep_audio, or if no transcript)
                 if self.config.whisper_keep_audio or not self.whisper or not msg.voice:
                     fid = await self.mm.upload_file(
@@ -450,9 +471,6 @@ class BridgeMostBridge:
                     )
                     if fid:
                         file_ids.append(fid)
-                elif self.whisper and msg.voice and not self.config.whisper_keep_audio:
-                    # Whisper active + keep_audio=false: skip audio upload
-                    pass
 
             elif msg.video or msg.video_note:
                 video = msg.video or msg.video_note
@@ -469,6 +487,15 @@ class BridgeMostBridge:
                 if fid:
                     file_ids.append(fid)
 
+            # Voice-to-text: transcribe BEFORE file cleanup
+            if self.whisper and msg.voice and local_file:
+                try:
+                    transcript = await self.whisper.transcribe(local_file.name)
+                    if transcript:
+                        voice_prefix = f"🎤 {transcript}"
+                except Exception as e:
+                    logger.error("Voice transcription failed: %s", e)
+
         finally:
             if local_file:
                 try:
@@ -478,6 +505,8 @@ class BridgeMostBridge:
 
         # Build message text
         text = msg.text or msg.caption or ""
+        if voice_prefix:
+            text = f"{voice_prefix}\n{text}" if text else voice_prefix
 
         # Post to MM as the real user
         if text or file_ids:
@@ -729,12 +758,17 @@ class BridgeMostBridge:
         if not tg_msg_id:
             return
 
-        # Find user by checking all DM channels for the post
+        # Find the user whose DM contains this post (the reaction target)
+        # The reaction comes from a bot (user_id is the bot), so we need
+        # the human user who owns the DM channel where this post lives
         target_user = None
         for ch_id, (usr, bot) in self._dm_to_user.items():
+            # Match: bot reacted on a post in this user's DM channel
             if user_id != usr.mm_user_id:
-                target_user = usr
-                break
+                # Verify this is the right channel by checking the message map
+                if tg_msg_id in self._tg_to_mm:
+                    target_user = usr
+                    break
 
         if not target_user:
             return
@@ -769,8 +803,9 @@ class BridgeMostBridge:
         target_user = None
         for ch_id, (usr, bot) in self._dm_to_user.items():
             if user_id != usr.mm_user_id:
-                target_user = usr
-                break
+                if tg_msg_id in self._tg_to_mm:
+                    target_user = usr
+                    break
 
         if not target_user:
             return

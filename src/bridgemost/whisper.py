@@ -46,19 +46,20 @@ class WhisperClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        data = aiohttp.FormData()
-        data.add_field(
-            "file",
-            open(audio_path, "rb"),  # noqa: SIM115
-            filename=path.name,
-            content_type=_guess_mime(path.suffix),
-        )
-        data.add_field("model", self.model)
-        if self.language:
-            data.add_field("language", self.language)
-        data.add_field("response_format", "json")
-
         try:
+            fh = open(audio_path, "rb")  # noqa: SIM115
+            data = aiohttp.FormData()
+            data.add_field(
+                "file",
+                fh,
+                filename=path.name,
+                content_type=_guess_mime(path.suffix),
+            )
+            data.add_field("model", self.model)
+            if self.language:
+                data.add_field("language", self.language)
+            data.add_field("response_format", "json")
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     endpoint, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
@@ -92,6 +93,11 @@ class WhisperClient:
         except Exception:
             logger.exception("Unexpected Whisper error")
             return None
+        finally:
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 def _guess_mime(suffix: str) -> str:

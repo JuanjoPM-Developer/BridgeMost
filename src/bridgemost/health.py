@@ -35,14 +35,15 @@ class HealthServer:
         self._stats["errors"] += 1
 
     async def _handle_health(self, request: web.Request) -> web.Response:
+        from . import __version__ as version
         uptime = int(time.time() - self._start_time)
         hours, remainder = divmod(uptime, 3600)
         minutes, seconds = divmod(remainder, 60)
 
         return web.json_response({
             "status": "ok",
-            "version": "0.6.0",
-                "transport": "websocket",
+            "version": version,
+            "transport": "websocket",
             "uptime": f"{hours}h{minutes}m{seconds}s",
             "uptime_seconds": uptime,
             "messages": {
