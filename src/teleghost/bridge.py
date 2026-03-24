@@ -115,6 +115,7 @@ class TeleGhostBridge:
                     "FATAL: Token validation FAILED for %s — check mm_token in config",
                     user.telegram_name,
                 )
+                await self.mm.close()
                 raise SystemExit(1)
             logger.info(
                 "Token OK for %s (MM user: %s)",
@@ -180,6 +181,7 @@ class TeleGhostBridge:
                 "FATAL: Zero DM channels discovered — bridge has nothing to relay. "
                 "Check MM connectivity, tokens, and bot user IDs."
             )
+            await self.mm.close()
             raise SystemExit(1)
 
         total_bots = sum(len(u.bots) for u in self.config.users)
