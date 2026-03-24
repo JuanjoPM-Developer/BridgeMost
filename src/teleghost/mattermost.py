@@ -114,6 +114,36 @@ class MattermostClient:
             posts = data.get("posts", {})
             return [posts[pid] for pid in reversed(order) if pid in posts]
 
+    async def edit_post(self, token: str, post_id: str, message: str) -> dict:
+        """Edit an existing post's message."""
+        session = await self._get_session()
+        payload = {"id": post_id, "message": message}
+        async with session.put(
+            f"{self.base_url}/api/v4/posts/{post_id}",
+            json=payload,
+            headers=self._headers(token),
+        ) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                logger.error("MM edit failed (%d): %s", resp.status, data)
+            else:
+                logger.debug("MM post edited: %s", post_id)
+            return data
+
+    async def delete_post(self, token: str, post_id: str) -> bool:
+        """Delete a post. Returns True on success."""
+        session = await self._get_session()
+        async with session.delete(
+            f"{self.base_url}/api/v4/posts/{post_id}",
+            headers=self._headers(token),
+        ) as resp:
+            if resp.status == 200:
+                logger.debug("MM post deleted: %s", post_id)
+                return True
+            data = await resp.json()
+            logger.error("MM delete failed (%d): %s", resp.status, data)
+            return False
+
     async def download_file(self, token: str, file_id: str, dest: str) -> str:
         """Download a file from MM to local path."""
         session = await self._get_session()

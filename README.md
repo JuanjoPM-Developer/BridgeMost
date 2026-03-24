@@ -145,8 +145,8 @@ curl http://localhost:9191/health
 - [x] Markdown MM → Telegram conversion
 - [x] Health endpoint
 - [x] Multi-bot routing (`/bot` command)
-- [ ] Edit/delete synchronization
-- [ ] WebSocket for MM (replace polling)
+- [x] Edit/delete synchronization
+- [x] WebSocket for MM (replace polling)
 - [ ] Reactions relay
 - [ ] Multi-user support (multiple TG users)
 

@@ -11,6 +11,8 @@ logger = logging.getLogger("teleghost.ws")
 
 # Mattermost WS event types we care about
 EVENT_POSTED = "posted"
+EVENT_POST_EDITED = "post_edited"
+EVENT_POST_DELETED = "post_deleted"
 
 
 class MattermostWebSocket:
@@ -25,12 +27,16 @@ class MattermostWebSocket:
         ws_url: str,
         token: str,
         on_post: Callable[[dict], Awaitable[None]],
+        on_post_edited: Callable[[dict], Awaitable[None]] | None = None,
+        on_post_deleted: Callable[[dict], Awaitable[None]] | None = None,
         reconnect_base: float = 2.0,
         reconnect_max: float = 60.0,
     ):
         self.ws_url = ws_url.rstrip("/")
         self.token = token
         self.on_post = on_post
+        self.on_post_edited = on_post_edited
+        self.on_post_deleted = on_post_deleted
         self._reconnect_base = reconnect_base
         self._reconnect_max = reconnect_max
         self._seq = 1
@@ -154,25 +160,46 @@ class MattermostWebSocket:
                 else:
                     logger.debug("Unknown WS msg type: %s", msg.type)
 
+    def _parse_post(self, data: dict) -> dict | None:
+        """Extract post dict from WS event data."""
+        post_data = data.get("data", {})
+        post_str = post_data.get("post", "")
+
+        if isinstance(post_str, str):
+            try:
+                return json.loads(post_str)
+            except json.JSONDecodeError:
+                return None
+        elif isinstance(post_str, dict):
+            return post_str
+        return None
+
     async def _handle_event(self, data: dict):
         """Process a single WebSocket event."""
         event = data.get("event")
 
         if event == EVENT_POSTED:
-            post_data = data.get("data", {})
-            post_str = post_data.get("post", "")
-
-            if isinstance(post_str, str):
+            post = self._parse_post(data)
+            if post:
                 try:
-                    post = json.loads(post_str)
-                except json.JSONDecodeError:
-                    return
-            elif isinstance(post_str, dict):
-                post = post_str
-            else:
-                return
+                    await self.on_post(post)
+                except Exception as e:
+                    logger.error("Error handling posted event: %s", e, exc_info=True)
 
-            try:
-                await self.on_post(post)
-            except Exception as e:
-                logger.error("Error handling WS post event: %s", e, exc_info=True)
+        elif event == EVENT_POST_EDITED:
+            if self.on_post_edited:
+                post = self._parse_post(data)
+                if post:
+                    try:
+                        await self.on_post_edited(post)
+                    except Exception as e:
+                        logger.error("Error handling post_edited event: %s", e, exc_info=True)
+
+        elif event == EVENT_POST_DELETED:
+            if self.on_post_deleted:
+                post = self._parse_post(data)
+                if post:
+                    try:
+                        await self.on_post_deleted(post)
+                    except Exception as e:
+                        logger.error("Error handling post_deleted event: %s", e, exc_info=True)

@@ -14,6 +14,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.constants import ParseMode
 
 from .config import Config, UserMapping
 from .health import HealthServer
@@ -80,6 +81,10 @@ class TeleGhostBridge:
         self._ws: MattermostWebSocket | None = None
         # Track DM channels we're interested in → user mapping
         self._dm_to_user: dict[str, tuple[UserMapping, object]] = {}
+        # Bidirectional message ID mapping for edit/delete sync
+        self._tg_to_mm: dict[int, str] = {}   # TG message_id → MM post_id
+        self._mm_to_tg: dict[str, int] = {}   # MM post_id → TG message_id
+        self._map_maxlen = 2000
         # Health server
         self.health = HealthServer(port=config.health_port)
 
@@ -133,6 +138,12 @@ class TeleGhostBridge:
             self._handle_telegram_message,
         ))
 
+        # Handle edited messages
+        app.add_handler(MessageHandler(
+            filters.UpdateType.EDITED_MESSAGE,
+            self._handle_telegram_edit,
+        ))
+
         # Start TG polling in background
         await app.initialize()
         await app.start()
@@ -155,6 +166,8 @@ class TeleGhostBridge:
             ws_url=ws_url,
             token=ws_token,
             on_post=self._handle_ws_post,
+            on_post_edited=self._handle_ws_edit,
+            on_post_deleted=self._handle_ws_delete,
         )
         await self._ws.start()
 
@@ -174,6 +187,16 @@ class TeleGhostBridge:
             await app.stop()
             await app.shutdown()
             await self.mm.close()
+
+    def _link_messages(self, tg_msg_id: int, mm_post_id: str):
+        """Track a TG↔MM message pair for edit/delete sync."""
+        self._tg_to_mm[tg_msg_id] = mm_post_id
+        self._mm_to_tg[mm_post_id] = tg_msg_id
+        # Evict oldest if over limit
+        while len(self._tg_to_mm) > self._map_maxlen:
+            oldest_tg = next(iter(self._tg_to_mm))
+            old_mm = self._tg_to_mm.pop(oldest_tg)
+            self._mm_to_tg.pop(old_mm, None)
 
     def _get_active_bot(self, user: UserMapping):
         """Get the active bot route for a user."""
@@ -334,6 +357,9 @@ class TeleGhostBridge:
             post_id = result.get("id")
             if post_id:
                 self._our_post_ids.append(post_id)
+                # Track TG↔MM message pair for edit/delete sync
+                if msg.message_id:
+                    self._link_messages(msg.message_id, post_id)
 
     async def _handle_ws_post(self, post: dict):
         """Handle a new post event from Mattermost WebSocket."""
@@ -367,21 +393,24 @@ class TeleGhostBridge:
             self.health.record_mm_to_tg()
 
             chunks = split_message(text)
-            for chunk in chunks:
+            for i, chunk in enumerate(chunks):
                 try:
                     tg_text = mm_to_telegram(chunk)
                     try:
-                        await self._tg_bot.send_message(
+                        sent = await self._tg_bot.send_message(
                             chat_id=user.telegram_id,
                             text=tg_text,
                             parse_mode="MarkdownV2",
                         )
                     except Exception:
-                        await self._tg_bot.send_message(
+                        sent = await self._tg_bot.send_message(
                             chat_id=user.telegram_id,
                             text=chunk,
                             parse_mode=None,
                         )
+                    # Track first chunk for edit/delete sync
+                    if i == 0 and sent and post_id:
+                        self._link_messages(sent.message_id, post_id)
                 except Exception as e:
                     logger.error("TG send error: %s", e)
 
@@ -403,6 +432,108 @@ class TeleGhostBridge:
                     Path(tmp.name).unlink(missing_ok=True)
             except Exception as e:
                 logger.error("TG file send error: %s", e)
+
+    async def _handle_telegram_edit(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle edited Telegram message → edit corresponding MM post."""
+        msg = update.edited_message
+        if not msg or not update.effective_user:
+            return
+
+        tg_id = update.effective_user.id
+        user = self.config.get_user_by_tg_id(tg_id)
+        if not user:
+            return
+
+        mm_post_id = self._tg_to_mm.get(msg.message_id)
+        if not mm_post_id:
+            logger.debug("TG edit for unmapped msg %d, ignoring", msg.message_id)
+            return
+
+        new_text = msg.text or msg.caption or ""
+        if not new_text:
+            return
+
+        logger.info("TG→MM edit [%s]: msg %d → post %s", user.telegram_name, msg.message_id, mm_post_id[:8])
+        result = await self.mm.edit_post(user.mm_token, mm_post_id, new_text)
+        if result.get("id"):
+            self._our_post_ids.append(result["id"])  # Prevent echo of edit event
+
+    async def _handle_ws_edit(self, post: dict):
+        """Handle an edited post event from Mattermost WebSocket."""
+        channel_id = post.get("channel_id", "")
+        post_id = post.get("id", "")
+        user_id = post.get("user_id", "")
+
+        if channel_id not in self._dm_to_user:
+            return
+
+        # Skip edits we triggered ourselves
+        if post_id in self._our_post_ids:
+            return
+
+        user, bot = self._dm_to_user[channel_id]
+        if user_id == user.mm_user_id:
+            return
+
+        tg_msg_id = self._mm_to_tg.get(post_id)
+        if not tg_msg_id:
+            logger.debug("MM edit for unmapped post %s, ignoring", post_id[:8])
+            return
+
+        new_text = post.get("message", "")
+        if not new_text:
+            return
+
+        logger.info("WS→TG edit [%s←%s]: post %s → msg %d", user.telegram_name, bot.name, post_id[:8], tg_msg_id)
+        try:
+            tg_text = mm_to_telegram(new_text)
+            try:
+                await self._tg_bot.edit_message_text(
+                    chat_id=user.telegram_id,
+                    message_id=tg_msg_id,
+                    text=tg_text,
+                    parse_mode="MarkdownV2",
+                )
+            except Exception:
+                await self._tg_bot.edit_message_text(
+                    chat_id=user.telegram_id,
+                    message_id=tg_msg_id,
+                    text=new_text,
+                )
+        except Exception as e:
+            logger.error("TG edit_message error: %s", e)
+
+    async def _handle_ws_delete(self, post: dict):
+        """Handle a deleted post event from Mattermost WebSocket."""
+        channel_id = post.get("channel_id", "")
+        post_id = post.get("id", "")
+        user_id = post.get("user_id", "")
+
+        if channel_id not in self._dm_to_user:
+            return
+
+        user, bot = self._dm_to_user[channel_id]
+        if user_id == user.mm_user_id:
+            return
+
+        tg_msg_id = self._mm_to_tg.get(post_id)
+        if not tg_msg_id:
+            return
+
+        logger.info("WS→TG delete [%s←%s]: post %s → msg %d", user.telegram_name, bot.name, post_id[:8], tg_msg_id)
+        try:
+            await self._tg_bot.delete_message(
+                chat_id=user.telegram_id,
+                message_id=tg_msg_id,
+            )
+        except Exception as e:
+            logger.error("TG delete_message error: %s", e)
+
+        # Cleanup mapping
+        self._mm_to_tg.pop(post_id, None)
+        self._tg_to_mm.pop(tg_msg_id, None)
 
     async def _retry_mm_post(
         self, user: UserMapping, channel_id: str, text: str,
