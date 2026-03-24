@@ -104,7 +104,7 @@ class TeleGhostBridge:
 
     async def start(self):
         """Start the bridge."""
-        logger.info("TeleGhost v0.5.0 starting (WebSocket + multi-bot + startup resilience)...")
+        logger.info("TeleGhost v0.6.0 starting (WebSocket + multi-bot + setup wizard)...")
 
         # Phase 1: Pre-validate all user tokens before anything else
         for user in self.config.users:

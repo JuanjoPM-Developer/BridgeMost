@@ -43,7 +43,7 @@ def main():
     setup_logging(config.log_level, config.log_file)
     logger = logging.getLogger("teleghost")
 
-    logger.info("TeleGhost v0.0.1 — Transparent Telegram ↔ Mattermost Bridge")
+    logger.info("TeleGhost v0.6.0 — Transparent Telegram ↔ Mattermost Bridge")
     logger.info("Users mapped: %d", len(config.users))
 
     bridge = TeleGhostBridge(config)
