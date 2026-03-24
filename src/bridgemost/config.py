@@ -56,6 +56,9 @@ class Config:
     # Health
     health_port: int = 9191
 
+    # Data persistence
+    data_dir: str = ""  # Directory for SQLite DB; empty = working directory
+
     # Voice-to-text (Whisper)
     whisper_url: str = ""          # e.g. http://localhost:9000
     whisper_api_key: str = ""      # Required for OpenAI/Groq, empty for local
@@ -176,6 +179,10 @@ def load_config(path: str | Path | None = None) -> Config:
     # Health
     health = raw.get("health", {})
     cfg.health_port = health.get("port", 9191)
+
+    # Data persistence
+    storage = raw.get("storage", {})
+    cfg.data_dir = storage.get("data_dir", "")
 
     # Voice-to-text
     vtt = raw.get("voice_to_text", {})

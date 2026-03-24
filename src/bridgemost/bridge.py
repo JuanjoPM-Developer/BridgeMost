@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import tempfile
+import time
 from collections import deque
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from .emoji import tg_emoji_to_mm, mm_emoji_to_tg
 from .health import HealthServer
 from .markdown import mm_to_telegram
 from .mattermost import MattermostClient
+from .store import MessageStore
 from .websocket import MattermostWebSocket
 from .whisper import WhisperClient
 
@@ -83,12 +85,18 @@ class BridgeMostBridge:
         self._ws: MattermostWebSocket | None = None
         # Track DM channels we're interested in → user mapping
         self._dm_to_user: dict[str, tuple[UserMapping, object]] = {}
-        # Bidirectional message ID mapping for edit/delete sync
-        self._tg_to_mm: dict[int, str] = {}   # TG message_id → MM post_id
-        self._mm_to_tg: dict[str, int] = {}   # MM post_id → TG message_id
-        self._map_maxlen = 2000
+        # Persistent message ID mapping (SQLite) for edit/delete/reaction sync
+        db_path = Path(config.data_dir) / "messages.db" if config.data_dir else Path("messages.db")
+        self._store = MessageStore(db_path)
+        # In-memory caches for hot path (avoid DB query on every WS event)
+        self._tg_to_mm: dict[int, str] = {}   # TG message_id → MM post_id (session cache)
+        self._mm_to_tg: dict[str, int] = {}   # MM post_id → TG message_id (session cache)
+        self._map_maxlen = 5000
         # Synthetic typing: track pending bot responses per user
         self._typing_tasks: dict[int, asyncio.Task] = {}  # tg_user_id → typing task
+        # TG rate limiter: max 25 msgs/sec to avoid Telegram 429
+        self._tg_send_times: deque[float] = deque(maxlen=25)
+        self._tg_rate_limit = 25  # Telegram allows ~30/s, keep margin
         # Health server
         self.health = HealthServer(port=config.health_port)
         # Voice-to-text
@@ -102,10 +110,53 @@ class BridgeMostBridge:
             )
             logger.info("Voice-to-text enabled: %s (model=%s)", config.whisper_url, config.whisper_model)
 
+    def _track_pair(self, tg_msg_id: int, mm_post_id: str, tg_chat_id: int = 0):
+        """Store a TG↔MM message pair in both SQLite and memory cache."""
+        # Memory cache (hot path)
+        self._tg_to_mm[tg_msg_id] = mm_post_id
+        self._mm_to_tg[mm_post_id] = tg_msg_id
+        # Evict oldest from memory cache if too large
+        if len(self._tg_to_mm) > self._map_maxlen:
+            oldest_key = next(iter(self._tg_to_mm))
+            oldest_val = self._tg_to_mm.pop(oldest_key)
+            self._mm_to_tg.pop(oldest_val, None)
+        # SQLite (persists across restarts)
+        self._store.put(tg_msg_id, mm_post_id, tg_chat_id)
+
+    def _lookup_mm(self, tg_msg_id: int) -> str | None:
+        """Find MM post_id for a TG message — memory first, then SQLite."""
+        mm_id = self._tg_to_mm.get(tg_msg_id)
+        if mm_id:
+            return mm_id
+        # Fallback to persistent store
+        mm_id = self._store.get_mm(tg_msg_id)
+        if mm_id:
+            # Promote to memory cache
+            self._tg_to_mm[tg_msg_id] = mm_id
+            self._mm_to_tg[mm_id] = tg_msg_id
+        return mm_id
+
+    def _lookup_tg(self, mm_post_id: str) -> int | None:
+        """Find TG message_id for an MM post — memory first, then SQLite."""
+        tg_id = self._mm_to_tg.get(mm_post_id)
+        if tg_id:
+            return tg_id
+        # Fallback to persistent store
+        tg_id = self._store.get_tg(mm_post_id)
+        if tg_id:
+            # Promote to memory cache
+            self._mm_to_tg[mm_post_id] = tg_id
+            self._tg_to_mm[tg_id] = mm_post_id
+        return tg_id
+
     async def start(self):
         """Start the bridge."""
         from . import __version__
         logger.info("BridgeMost v%s starting (WebSocket + multi-bot + setup wizard)...", __version__)
+
+        # Open persistent message store
+        self._store.open()
+        self.health.store_count_fn = self._store.count
 
         # Phase 1: Pre-validate all user tokens before anything else
         for user in self.config.users:
@@ -117,6 +168,7 @@ class BridgeMostBridge:
                     user.telegram_name,
                 )
                 await self.mm.close()
+                self._store.close()
                 raise SystemExit(1)
             logger.info(
                 "Token OK for %s (MM user: %s)",
@@ -183,6 +235,7 @@ class BridgeMostBridge:
                 "Check MM connectivity, tokens, and bot user IDs."
             )
             await self.mm.close()
+            self._store.close()
             raise SystemExit(1)
 
         total_bots = sum(len(u.bots) for u in self.config.users)
@@ -289,16 +342,23 @@ class BridgeMostBridge:
             await app.stop()
             await app.shutdown()
             await self.mm.close()
+            self._store.close()
 
-    def _link_messages(self, tg_msg_id: int, mm_post_id: str):
-        """Track a TG↔MM message pair for edit/delete sync."""
-        self._tg_to_mm[tg_msg_id] = mm_post_id
-        self._mm_to_tg[mm_post_id] = tg_msg_id
-        # Evict oldest if over limit
-        while len(self._tg_to_mm) > self._map_maxlen:
-            oldest_tg = next(iter(self._tg_to_mm))
-            old_mm = self._tg_to_mm.pop(oldest_tg)
-            self._mm_to_tg.pop(old_mm, None)
+    async def _tg_rate_wait(self):
+        """Wait if we're sending too fast to Telegram (avoid 429)."""
+        now = time.monotonic()
+        if len(self._tg_send_times) >= self._tg_rate_limit:
+            oldest = self._tg_send_times[0]
+            elapsed = now - oldest
+            if elapsed < 1.0:
+                wait = 1.0 - elapsed + 0.05  # small padding
+                logger.debug("TG rate limit: waiting %.2fs", wait)
+                await asyncio.sleep(wait)
+        self._tg_send_times.append(time.monotonic())
+
+    def _link_messages(self, tg_msg_id: int, mm_post_id: str, tg_chat_id: int = 0):
+        """Track a TG↔MM message pair for edit/delete sync (persistent + cache)."""
+        self._track_pair(tg_msg_id, mm_post_id, tg_chat_id)
 
     def _get_active_bot(self, user: UserMapping):
         """Get the active bot route for a user."""
@@ -557,6 +617,7 @@ class BridgeMostBridge:
             chunks = split_message(text)
             for i, chunk in enumerate(chunks):
                 try:
+                    await self._tg_rate_wait()
                     tg_text = mm_to_telegram(chunk)
                     try:
                         sent = await self._tg_bot.send_message(
@@ -608,7 +669,7 @@ class BridgeMostBridge:
         if not user:
             return
 
-        mm_post_id = self._tg_to_mm.get(msg.message_id)
+        mm_post_id = self._lookup_mm(msg.message_id)
         if not mm_post_id:
             logger.debug("TG edit for unmapped msg %d, ignoring", msg.message_id)
             return
@@ -639,7 +700,7 @@ class BridgeMostBridge:
         if user_id == user.mm_user_id:
             return
 
-        tg_msg_id = self._mm_to_tg.get(post_id)
+        tg_msg_id = self._lookup_tg(post_id)
         if not tg_msg_id:
             logger.debug("MM edit for unmapped post %s, ignoring", post_id[:8])
             return
@@ -680,7 +741,7 @@ class BridgeMostBridge:
         if user_id == user.mm_user_id:
             return
 
-        tg_msg_id = self._mm_to_tg.get(post_id)
+        tg_msg_id = self._lookup_tg(post_id)
         if not tg_msg_id:
             return
 
@@ -714,7 +775,7 @@ class BridgeMostBridge:
             return
 
         msg_id = reaction_update.message_id
-        mm_post_id = self._tg_to_mm.get(msg_id)
+        mm_post_id = self._lookup_mm(msg_id)
         if not mm_post_id:
             logger.debug("TG reaction on unmapped msg %d, ignoring", msg_id)
             return
@@ -754,7 +815,7 @@ class BridgeMostBridge:
         if not post_id or not emoji_name:
             return
 
-        tg_msg_id = self._mm_to_tg.get(post_id)
+        tg_msg_id = self._lookup_tg(post_id)
         if not tg_msg_id:
             return
 
@@ -766,7 +827,7 @@ class BridgeMostBridge:
             # Match: bot reacted on a post in this user's DM channel
             if user_id != usr.mm_user_id:
                 # Verify this is the right channel by checking the message map
-                if tg_msg_id in self._tg_to_mm:
+                if self._store.has_tg(tg_msg_id):
                     target_user = usr
                     break
 
@@ -796,14 +857,14 @@ class BridgeMostBridge:
         if not post_id:
             return
 
-        tg_msg_id = self._mm_to_tg.get(post_id)
+        tg_msg_id = self._lookup_tg(post_id)
         if not tg_msg_id:
             return
 
         target_user = None
         for ch_id, (usr, bot) in self._dm_to_user.items():
             if user_id != usr.mm_user_id:
-                if tg_msg_id in self._tg_to_mm:
+                if self._store.has_tg(tg_msg_id):
                     target_user = usr
                     break
 

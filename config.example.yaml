@@ -33,6 +33,10 @@ polling:
 health:
   port: 9191
 
+# Data persistence
+storage:
+  data_dir: ""                          # Directory for SQLite DB; empty = working directory
+
 # Voice-to-text transcription (optional)
 # Transcribes voice messages before posting to Mattermost
 # Supports any OpenAI-compatible Whisper API

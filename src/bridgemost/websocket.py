@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import random
 from typing import Callable, Awaitable
 
 import aiohttp
@@ -87,10 +88,13 @@ class MattermostWebSocket:
                 break
             except Exception as e:
                 consecutive_failures += 1
-                delay = min(
+                base_delay = min(
                     self._reconnect_base * (2 ** (consecutive_failures - 1)),
                     self._reconnect_max,
                 )
+                # Add ±25% jitter to prevent thundering herd on MM restart
+                jitter = base_delay * random.uniform(-0.25, 0.25)
+                delay = max(0.5, base_delay + jitter)
                 logger.warning(
                     "WebSocket disconnected (%s), reconnecting in %.1fs (attempt %d)",
                     e, delay, consecutive_failures,

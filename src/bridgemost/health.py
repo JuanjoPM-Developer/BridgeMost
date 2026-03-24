@@ -22,6 +22,7 @@ class HealthServer:
             "last_mm_msg": 0.0,
         }
         self._runner: web.AppRunner | None = None
+        self.store_count_fn = None  # Set by bridge to report persistent mapping count
 
     def record_tg_to_mm(self):
         self._stats["tg_to_mm"] += 1
@@ -54,6 +55,9 @@ class HealthServer:
             "last_activity": {
                 "tg_msg_ago": int(time.time() - self._stats["last_tg_msg"]) if self._stats["last_tg_msg"] else None,
                 "mm_msg_ago": int(time.time() - self._stats["last_mm_msg"]) if self._stats["last_mm_msg"] else None,
+            },
+            "store": {
+                "persistent_mappings": self.store_count_fn() if self.store_count_fn else None,
             },
         })
 
