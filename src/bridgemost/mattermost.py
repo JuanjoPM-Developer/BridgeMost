@@ -227,6 +227,53 @@ class MattermostClient:
             logger.error("MM download failed (%d)", resp.status)
             return ""
 
+    async def get_user_status(self, token: str, user_id: str) -> dict | None:
+        """Get a user's online status (online/away/dnd/offline)."""
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}/api/v4/users/{user_id}/status",
+                headers=self._headers(token),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception:
+            return None
+
+    async def get_user_info(self, token: str, user_id: str) -> dict | None:
+        """Get user details (username, email, roles, etc.)."""
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}/api/v4/users/{user_id}",
+                headers=self._headers(token),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception:
+            return None
+
+    async def get_last_post_in_channel(self, token: str, channel_id: str) -> dict | None:
+        """Get the most recent post in a channel."""
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}/api/v4/channels/{channel_id}/posts",
+                headers=self._headers(token),
+                params={"per_page": 1, "page": 0},
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    order = data.get("order", [])
+                    posts = data.get("posts", {})
+                    if order and order[0] in posts:
+                        return posts[order[0]]
+                return None
+        except Exception:
+            return None
+
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()

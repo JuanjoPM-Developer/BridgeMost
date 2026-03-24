@@ -256,6 +256,12 @@ class BridgeMostBridge:
 
         # /bot command for switching active bot
         app.add_handler(CommandHandler("bot", self._handle_bot_command))
+        # /bots — list all bots with live status
+        app.add_handler(CommandHandler("bots", self._handle_bots_command))
+        # /status — detailed info about active bot
+        app.add_handler(CommandHandler("status", self._handle_status_command))
+        # /ping — measure round-trip latency
+        app.add_handler(CommandHandler("ping", self._handle_ping_command))
 
         # Handle ALL messages (text, photos, documents, etc.)
         app.add_handler(MessageHandler(
@@ -451,6 +457,166 @@ class BridgeMostBridge:
                 await update.effective_message.reply_text(
                     f"❌ Bot '{target}' no encontrado. Disponibles: {names}"
                 )
+
+    async def _handle_bots_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /bots — list all bots with live online/offline status."""
+        if not update.effective_user or not update.effective_message:
+            return
+
+        tg_id = update.effective_user.id
+        user = self.config.get_user_by_tg_id(tg_id)
+        if not user:
+            return
+
+        lines = ["🤖 *Bot Status*\n"]
+
+        for bot in user.bots:
+            # Check online status via MM API
+            status_data = await self.mm.get_user_status(user.mm_token, bot.mm_bot_id)
+            if status_data:
+                raw_status = status_data.get("status", "offline")
+                status_icons = {
+                    "online": "🟢", "away": "🟡", "dnd": "🔴", "offline": "⚫"
+                }
+                icon = status_icons.get(raw_status, "⚪")
+            else:
+                icon = "❓"
+                raw_status = "unknown"
+
+            active = " ← activo" if bot.name == user.active_bot else ""
+            dm = "✅" if bot.mm_dm_channel else "❌"
+            lines.append(f"{icon} `{bot.name}` — {raw_status} | DM: {dm}{active}")
+
+        lines.append(f"\n📊 {len(user.bots)} bots | Activo: *{user.active_bot}*")
+        lines.append("Usa `/bot nombre` para cambiar")
+
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode="Markdown"
+        )
+
+    async def _handle_status_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /status — detailed info about the active bot."""
+        if not update.effective_user or not update.effective_message:
+            return
+
+        tg_id = update.effective_user.id
+        user = self.config.get_user_by_tg_id(tg_id)
+        if not user:
+            return
+
+        active_bot = self._get_active_bot(user)
+        if not active_bot:
+            await update.effective_message.reply_text("❌ No hay bot activo")
+            return
+
+        lines = [f"📋 *{active_bot.name}* — Estado detallado\n"]
+
+        # Online status
+        status_data = await self.mm.get_user_status(user.mm_token, active_bot.mm_bot_id)
+        if status_data:
+            raw_status = status_data.get("status", "offline")
+            last_activity = status_data.get("last_activity_at", 0)
+            status_icons = {
+                "online": "🟢 Online", "away": "🟡 Away",
+                "dnd": "🔴 DND", "offline": "⚫ Offline"
+            }
+            lines.append(f"Estado: {status_icons.get(raw_status, raw_status)}")
+            if last_activity:
+                import datetime
+                dt = datetime.datetime.fromtimestamp(last_activity / 1000)
+                lines.append(f"Última actividad: {dt.strftime('%H:%M:%S')}")
+
+        # User info (model from username hints)
+        user_info = await self.mm.get_user_info(user.mm_token, active_bot.mm_bot_id)
+        if user_info:
+            username = user_info.get("username", "?")
+            nickname = user_info.get("nickname", "")
+            position = user_info.get("position", "")
+            lines.append(f"Username: @{username}")
+            if nickname:
+                lines.append(f"Nickname: {nickname}")
+            if position:
+                lines.append(f"Rol: {position}")
+
+        # DM channel
+        lines.append(f"DM Channel: `{active_bot.mm_dm_channel[:12]}...`" if active_bot.mm_dm_channel else "DM: ❌ No descubierto")
+
+        # Last message from bot
+        if active_bot.mm_dm_channel:
+            last_post = await self.mm.get_last_post_in_channel(user.mm_token, active_bot.mm_dm_channel)
+            if last_post:
+                msg_text = last_post.get("message", "")[:80]
+                if msg_text:
+                    lines.append(f"\nÚltimo mensaje:\n> {msg_text}")
+
+        # Store stats
+        store_count = self._store.count()
+        lines.append(f"\n📦 Mappings persistentes: {store_count}")
+
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode="Markdown"
+        )
+
+    async def _handle_ping_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /ping — measure TG→MM→TG round-trip latency."""
+        if not update.effective_user or not update.effective_message:
+            return
+
+        tg_id = update.effective_user.id
+        user = self.config.get_user_by_tg_id(tg_id)
+        if not user:
+            return
+
+        active_bot = self._get_active_bot(user)
+        if not active_bot or not active_bot.mm_dm_channel:
+            await update.effective_message.reply_text("❌ No hay bot activo con DM")
+            return
+
+        t0 = time.monotonic()
+
+        # Step 1: Post to MM
+        result = await self.mm.post_message(
+            user.mm_token, active_bot.mm_dm_channel, "🏓 ping"
+        )
+        t_mm_post = time.monotonic()
+
+        if not result or "id" not in result:
+            await update.effective_message.reply_text("❌ Ping falló — no pude postear en MM")
+            return
+
+        ping_post_id = result["id"]
+        self._our_post_ids.append(ping_post_id)
+
+        # Step 2: Delete the ping message (cleanup)
+        await self.mm.delete_post(user.mm_token, ping_post_id)
+        t_mm_delete = time.monotonic()
+
+        # Step 3: Reply to TG
+        t_total = time.monotonic()
+
+        mm_post_ms = int((t_mm_post - t0) * 1000)
+        mm_delete_ms = int((t_mm_delete - t_mm_post) * 1000)
+        total_ms = int((t_total - t0) * 1000)
+
+        # WS status
+        ws_status = "🟢 connected" if self._ws and self._ws._ws and not self._ws._ws.closed else "🔴 disconnected"
+
+        await update.effective_message.reply_text(
+            f"🏓 *Pong*\n\n"
+            f"TG → MM post: `{mm_post_ms}ms`\n"
+            f"MM delete: `{mm_delete_ms}ms`\n"
+            f"Total: `{total_ms}ms`\n\n"
+            f"WebSocket: {ws_status}\n"
+            f"Bot: `{active_bot.name}`",
+            parse_mode="Markdown",
+        )
+        logger.info("Ping: post=%dms delete=%dms total=%dms", mm_post_ms, mm_delete_ms, total_ms)
 
     async def _handle_telegram_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
