@@ -1,0 +1,34 @@
+# TeleGhost Configuration
+# Copy this file to config.yaml and fill in your values
+
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"  # From @BotFather
+
+mattermost:
+  url: "http://127.0.0.1:8065"         # Your MM server URL
+  bot_token: "YOUR_MM_BOT_TOKEN"        # Any bot token (for reading responses)
+  bot_user_id: "YOUR_MM_BOT_USER_ID"    # User ID of the bot above
+
+users:
+  - telegram_id: 123456789              # Your Telegram user ID (from @userinfobot)
+    telegram_name: "Your Name"
+    mm_user_id: "your_mm_user_id"       # Mattermost user ID
+    mm_token: "YOUR_MM_PAT"             # Personal Access Token
+    bots:
+      - name: "MyBot"
+        mm_bot_id: "bot_user_id"        # MM user ID of the bot
+        mm_dm_channel: ""               # Leave empty for auto-discovery
+        default: true
+      - name: "AnotherBot"
+        mm_bot_id: "another_bot_user_id"
+
+logging:
+  level: "INFO"
+  file: "/var/log/teleghost.log"        # Or "" for stdout only
+
+polling:
+  telegram_timeout: 30
+  mm_poll_interval: 0.5                 # Seconds between MM polls
+
+health:
+  port: 9191

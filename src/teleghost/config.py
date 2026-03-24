@@ -1,0 +1,173 @@
+"""Configuration loader for TeleGhost."""
+
+import os
+import yaml
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+logger = logging.getLogger("teleghost")
+
+
+@dataclass
+class BotRoute:
+    """A bot that the user can talk to via the relay."""
+    name: str          # Display name (e.g. "MyBot", "Assistant")
+    mm_bot_id: str     # MM user ID of the bot
+    mm_dm_channel: str = ""  # Will be auto-discovered if empty
+    is_default: bool = False
+
+
+@dataclass
+class UserMapping:
+    """Maps a Telegram user to a Mattermost account."""
+    telegram_id: int
+    telegram_name: str
+    mm_user_id: str
+    mm_token: str
+    mm_dm_channel: str = ""       # Legacy: single-bot DM channel
+    mm_target_bot: str = ""       # Legacy: single bot target
+    bots: list[BotRoute] = field(default_factory=list)
+    active_bot: str = ""          # Currently active bot name
+
+
+@dataclass
+class Config:
+    """TeleGhost configuration."""
+    # Telegram
+    tg_bot_token: str = ""
+
+    # Mattermost
+    mm_url: str = "http://127.0.0.1:8065"
+    mm_bot_token: str = ""
+    mm_bot_user_id: str = ""
+
+    # User mappings
+    users: list[UserMapping] = field(default_factory=list)
+
+    # Logging
+    log_level: str = "INFO"
+    log_file: str = ""
+
+    # Polling
+    tg_timeout: int = 30
+    mm_poll_interval: float = 0.5
+
+    # Health
+    health_port: int = 9191
+
+    def get_user_by_tg_id(self, tg_id: int) -> UserMapping | None:
+        """Find user mapping by Telegram ID."""
+        for u in self.users:
+            if u.telegram_id == tg_id:
+                return u
+        return None
+
+    def get_user_by_mm_id(self, mm_id: str) -> UserMapping | None:
+        """Find user mapping by Mattermost user ID."""
+        for u in self.users:
+            if u.mm_user_id == mm_id:
+                return u
+        return None
+
+
+def load_config(path: str | Path | None = None) -> Config:
+    """Load configuration from YAML file.
+
+    Search order:
+    1. Explicit path argument
+    2. TELEGHOST_CONFIG env var
+    3. ./config.yaml
+    4. /etc/teleghost/config.yaml
+    """
+    candidates = []
+    if path:
+        candidates.append(Path(path))
+    if env := os.environ.get("TELEGHOST_CONFIG"):
+        candidates.append(Path(env))
+    candidates.append(Path("config.yaml"))
+    candidates.append(Path("/etc/teleghost/config.yaml"))
+
+    config_path = None
+    for c in candidates:
+        if c.exists():
+            config_path = c
+            break
+
+    if not config_path:
+        raise FileNotFoundError(
+            f"No config file found. Searched: {[str(c) for c in candidates]}"
+        )
+
+    logger.info("Loading config from %s", config_path)
+    with open(config_path) as f:
+        raw = yaml.safe_load(f)
+
+    cfg = Config()
+
+    # Telegram
+    tg = raw.get("telegram", {})
+    cfg.tg_bot_token = tg.get("bot_token", "")
+
+    # Mattermost
+    mm = raw.get("mattermost", {})
+    cfg.mm_url = mm.get("url", cfg.mm_url).rstrip("/")
+    cfg.mm_bot_token = mm.get("bot_token", "")
+    cfg.mm_bot_user_id = mm.get("bot_user_id", "")
+
+    # Users
+    for u in raw.get("users", []):
+        bots = []
+        for b in u.get("bots", []):
+            bots.append(BotRoute(
+                name=b["name"],
+                mm_bot_id=b["mm_bot_id"],
+                mm_dm_channel=b.get("mm_dm_channel", ""),
+                is_default=b.get("default", False),
+            ))
+
+        mapping = UserMapping(
+            telegram_id=int(u["telegram_id"]),
+            telegram_name=u.get("telegram_name", "Unknown"),
+            mm_user_id=u["mm_user_id"],
+            mm_token=u["mm_token"],
+            mm_dm_channel=u.get("mm_dm_channel", ""),
+            mm_target_bot=u.get("mm_target_bot", ""),
+            bots=bots,
+        )
+
+        # Set active bot to default or first
+        default_bots = [b for b in bots if b.is_default]
+        if default_bots:
+            mapping.active_bot = default_bots[0].name
+        elif bots:
+            mapping.active_bot = bots[0].name
+
+        # Legacy compatibility: if no bots list but mm_target_bot exists,
+        # create a single bot route
+        if not bots and u.get("mm_target_bot"):
+            mapping.bots = [BotRoute(
+                name="default",
+                mm_bot_id=u["mm_target_bot"],
+                mm_dm_channel=u.get("mm_dm_channel", ""),
+                is_default=True,
+            )]
+            mapping.active_bot = "default"
+
+        cfg.users.append(mapping)
+
+    # Logging
+    log = raw.get("logging", {})
+    cfg.log_level = log.get("level", "INFO")
+    cfg.log_file = log.get("file", "")
+
+    # Polling
+    poll = raw.get("polling", {})
+    cfg.tg_timeout = poll.get("telegram_timeout", 30)
+    cfg.mm_poll_interval = poll.get("mm_poll_interval", 0.5)
+
+    # Health
+    health = raw.get("health", {})
+    cfg.health_port = health.get("port", 9090)
+
+    return cfg
