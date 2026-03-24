@@ -41,7 +41,7 @@ class HealthServer:
 
         return web.json_response({
             "status": "ok",
-            "version": "0.1.0",
+            "version": "0.3.1",
                 "transport": "websocket",
             "uptime": f"{hours}h{minutes}m{seconds}s",
             "uptime_seconds": uptime,

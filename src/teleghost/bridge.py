@@ -86,12 +86,14 @@ class TeleGhostBridge:
         self._tg_to_mm: dict[int, str] = {}   # TG message_id → MM post_id
         self._mm_to_tg: dict[str, int] = {}   # MM post_id → TG message_id
         self._map_maxlen = 2000
+        # Synthetic typing: track pending bot responses per user
+        self._typing_tasks: dict[int, asyncio.Task] = {}  # tg_user_id → typing task
         # Health server
         self.health = HealthServer(port=config.health_port)
 
     async def start(self):
         """Start the bridge."""
-        logger.info("TeleGhost v0.3.0 starting (WebSocket + multi-bot)...")
+        logger.info("TeleGhost v0.3.1 starting (WebSocket + multi-bot + synthetic typing)...")
 
         # Auto-discover DM channels for all bot routes
         for user in self.config.users:
@@ -213,6 +215,38 @@ class TeleGhostBridge:
                 return bot
         return user.bots[0] if user.bots else None
 
+    async def _typing_loop(self, tg_user_id: int):
+        """Send 'typing' chat action every 4s until cancelled.
+
+        Telegram typing indicator lasts ~5s, so 4s refresh keeps it alive.
+        This runs after we post a user message to MM, and stops when the
+        bot's response arrives via WebSocket.
+        """
+        try:
+            while True:
+                await self._tg_bot.send_chat_action(
+                    chat_id=tg_user_id,
+                    action="typing",
+                )
+                await asyncio.sleep(4)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug("Typing loop error for %d: %s", tg_user_id, e)
+
+    def _start_typing(self, user: UserMapping):
+        """Start synthetic typing indicator for a user."""
+        # Cancel any existing typing task
+        self._stop_typing(user)
+        task = asyncio.create_task(self._typing_loop(user.telegram_id))
+        self._typing_tasks[user.telegram_id] = task
+
+    def _stop_typing(self, user: UserMapping):
+        """Stop synthetic typing indicator for a user."""
+        task = self._typing_tasks.pop(user.telegram_id, None)
+        if task and not task.done():
+            task.cancel()
+
     async def _handle_bot_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
@@ -247,6 +281,8 @@ class TeleGhostBridge:
                     break
 
             if matched:
+                # Stop any pending typing from previous bot
+                self._stop_typing(user)
                 user.active_bot = matched.name
                 await update.effective_message.reply_text(
                     f"── Ahora hablando con *{matched.name}* ──",
@@ -369,6 +405,8 @@ class TeleGhostBridge:
                 # Track TG↔MM message pair for edit/delete sync
                 if msg.message_id:
                     self._link_messages(msg.message_id, post_id)
+                # Start synthetic typing — bot is now processing
+                self._start_typing(user)
 
     async def _handle_ws_post(self, post: dict):
         """Handle a new post event from Mattermost WebSocket."""
@@ -389,6 +427,9 @@ class TeleGhostBridge:
         # Skip posts from the mapped user (their own messages)
         if user_id == user.mm_user_id:
             return
+
+        # Bot responded — stop synthetic typing
+        self._stop_typing(user)
 
         # This is a bot response — relay to Telegram
         text = post.get("message", "")
@@ -663,7 +704,12 @@ class TeleGhostBridge:
             logger.error("TG clear_reaction error: %s", e)
 
     async def _handle_ws_typing(self, typing_info: dict):
-        """Handle MM typing event → send 'typing' chat action to Telegram."""
+        """Handle MM typing event → extend synthetic typing.
+
+        Most OpenClaw bots don't emit typing events, so this serves as
+        a supplementary signal. The main typing comes from _typing_loop
+        started when we post the user's message.
+        """
         channel_id = typing_info.get("channel_id", "")
         user_id = typing_info.get("user_id", "")
 
@@ -676,14 +722,10 @@ class TeleGhostBridge:
         if user_id == user.mm_user_id:
             return
 
-        try:
-            await self._tg_bot.send_chat_action(
-                chat_id=user.telegram_id,
-                action="typing",
-            )
-            logger.debug("WS→TG typing [%s←%s]", user.telegram_name, bot.name)
-        except Exception as e:
-            logger.error("TG send_chat_action error: %s", e)
+        # If we don't already have a synthetic typing loop running, start one
+        if user.telegram_id not in self._typing_tasks or self._typing_tasks[user.telegram_id].done():
+            self._start_typing(user)
+            logger.debug("WS typing extended [%s←%s]", user.telegram_name, bot.name)
 
     async def _retry_mm_post(
         self, user: UserMapping, channel_id: str, text: str,
