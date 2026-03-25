@@ -2,6 +2,59 @@
 
 All notable changes to BridgeMost are documented here.
 
+## v2.1.0 (2026-03-25)
+
+### Added
+- **Google Chat adapter** — `adapters/googlechat.py` (310 lines)
+  - Service Account with domain-wide delegation (ghost mode)
+  - Posts as the real Workspace user in Google Chat Spaces
+  - Message polling, edit, delete, emoji reactions
+  - `/bot`, `/bots`, `/status` commands
+  - Auto-split long messages
+- Config: `googlechat:` section with `credentials_file`, `delegated_user`, `space`, `poll_interval`
+- Auto-detect adapter from config sections (telegram vs googlechat)
+
+### Changed
+- `__main__.py` routes to correct adapter at startup
+- `pyproject.toml`: added `google-auth` + `google-api-python-client` dependencies
+- `config.example.yaml`: full Google Chat section with inline documentation
+
+## v2.0.2 (2026-03-25)
+
+### Changed
+- README rewritten for multi-platform architecture (reduced Telegram-specific references)
+- GitHub repo description updated to "Multi-platform ↔ Mattermost transparent bridge"
+- `pyproject.toml` keywords updated
+
+## v2.0.1 (2026-03-25)
+
+### Fixed
+- Removed unused `Path` import from `base.py`
+- Renamed TG-specific emoji function names in core to `unicode_to_mm`/`mm_to_unicode`
+- Replaced private adapter attribute access in `core.py` with `hasattr` check
+
+## v2.0.0 (2026-03-25)
+
+### Changed — **Plugin Adapter Architecture**
+- Extracted Telegram logic into `adapters/telegram.py` (461 lines)
+- Created `adapters/base.py` — abstract interface (8 methods + 2 dataclasses + 4 callbacks)
+- Created `core.py` — platform-agnostic relay engine (595 lines)
+- `bridge.py` reduced to 31-line backward-compatibility wrapper
+- Adding new platforms = one Python file implementing `BaseAdapter`, zero core changes
+
+## v1.0.0 (2026-03-25)
+
+### Added
+- Published to **PyPI** (`pip install bridgemost`)
+- GitHub Actions CI/CD pipeline (Python 3.11/3.12/3.13 + lint)
+
+## v0.9.8 (2026-03-25)
+
+### Fixed
+- `_relay_mm_file_to_tg` used wrong token for DM file downloads (403 silent fail)
+- `file_ids` from WebSocket could be string instead of list — added type guard
+- Empty `config.users` caused crash on WS fallback — fail-fast with clear message
+
 ## v0.9.7 (2026-03-25)
 
 ### Added

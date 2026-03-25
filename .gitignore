@@ -8,12 +8,18 @@ build/
 .eggs/
 venv/
 .venv/
+.pytest_cache/
 
-# Config (contains secrets)
+# Config (contains secrets — NEVER commit)
 config.yaml
 
 # Logs
 *.log
+
+# SQLite databases
+messages.db
+messages.db-shm
+messages.db-wal
 
 # IDE
 .vscode/
@@ -24,6 +30,3 @@ config.yaml
 # OS
 .DS_Store
 Thumbs.db
-messages.db
-messages.db-shm
-messages.db-wal

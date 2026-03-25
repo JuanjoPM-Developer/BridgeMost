@@ -5,16 +5,16 @@
 
 **Multi-Platform ↔ Mattermost Transparent Bridge**
 
-BridgeMost makes your messages from **any chat platform** appear **natively** in Mattermost — as your real user, with your avatar and name. Bot responses relay back instantly via WebSocket.
+BridgeMost makes your messages from **Telegram, Google Chat, or any supported platform** appear **natively** in Mattermost — as your real user, with your avatar and name. Bot responses relay back instantly via WebSocket.
 
-Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost posts as **your actual Mattermost account**. Nobody in Mattermost can tell you're writing from another platform.
+Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost posts as **your actual Mattermost account** using Personal Access Tokens. Nobody in Mattermost can tell you're writing from another platform.
 
 ## 🔌 Supported Platforms (Adapters)
 
 | Platform | Status | Description |
 |----------|--------|-------------|
 | **Telegram** | ✅ Production | Full support — text, media, voice, reactions, edits, deletes |
-| **Google Chat** | 🔜 Planned | Workspace ghost mode via Service Account |
+| **Google Chat** | ✅ v2.1.0 | Workspace ghost mode via Service Account + domain-wide delegation |
 | **Slack** | 🔜 Planned | User token impersonation |
 | **Matrix** | 🔜 Planned | Application Service ghost mode |
 
@@ -330,6 +330,8 @@ The core engine handles all Mattermost interaction, message tracking, retry, and
 
 | Version | Date | Highlight |
 |---------|------|-----------|
+| v2.1.0 | 2026-03-25 | **Google Chat adapter** — Service Account ghost mode, polling, edit/delete/reactions |
+| v2.0.2 | 2026-03-25 | README rewritten for multi-platform architecture |
 | v2.0.1 | 2026-03-25 | Audit cleanup: platform-agnostic emoji names, encapsulation fix |
 | v2.0.0 | 2026-03-25 | **Plugin adapter architecture** — Telegram extracted as adapter, core engine separated |
 | v1.0.0 | 2026-03-25 | **Stable release** — PyPI, CI/CD, full test suite |

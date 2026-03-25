@@ -1,5 +1,5 @@
 [Unit]
-Description=BridgeMost — Telegram ↔ Mattermost transparent bridge
+Description=BridgeMost — Multi-Platform ↔ Mattermost transparent bridge
 After=network.target
 
 [Service]
