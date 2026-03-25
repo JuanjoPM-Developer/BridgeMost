@@ -31,7 +31,7 @@ class MessageStore:
         self._conn: sqlite3.Connection | None = None
 
     def open(self):
-        """Open database and create table if needed."""
+        """Open database and create tables if needed."""
         self._conn = sqlite3.connect(self.db_path, timeout=5.0)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=3000")
@@ -47,6 +47,13 @@ class MessageStore:
         self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_mm_post_id
             ON message_map (mm_post_id)
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                tg_user_id  INTEGER PRIMARY KEY,
+                active_bot  TEXT NOT NULL,
+                updated_at  REAL NOT NULL
+            )
         """)
         self._conn.commit()
 
@@ -108,6 +115,27 @@ class MessageStore:
         if not self._conn:
             return 0
         return self._conn.execute("SELECT COUNT(*) FROM message_map").fetchone()[0]
+
+    def set_active_bot(self, tg_user_id: int, bot_name: str):
+        """Persist active bot selection for a user."""
+        if not self._conn:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO user_prefs (tg_user_id, active_bot, updated_at) "
+            "VALUES (?, ?, ?)",
+            (tg_user_id, bot_name, time.time()),
+        )
+        self._conn.commit()
+
+    def get_active_bot(self, tg_user_id: int) -> str | None:
+        """Retrieve persisted active bot for a user."""
+        if not self._conn:
+            return None
+        row = self._conn.execute(
+            "SELECT active_bot FROM user_prefs WHERE tg_user_id = ?",
+            (tg_user_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     def _prune(self):
         """Remove entries older than TTL."""

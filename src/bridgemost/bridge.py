@@ -158,6 +158,17 @@ class BridgeMostBridge:
         self._store.open()
         self.health.store_count_fn = self._store.count
 
+        # Restore persisted active bot selections
+        for user in self.config.users:
+            saved_bot = self._store.get_active_bot(user.telegram_id)
+            if saved_bot:
+                # Verify the saved bot still exists in config
+                if any(b.name == saved_bot for b in user.bots):
+                    user.active_bot = saved_bot
+                    logger.info("Restored active bot for %s: %s", user.telegram_name, saved_bot)
+                else:
+                    logger.warning("Saved bot '%s' no longer in config for %s, using default", saved_bot, user.telegram_name)
+
         # Phase 1: Pre-validate all user tokens before anything else
         for user in self.config.users:
             logger.info("Validating token for %s...", user.telegram_name)
@@ -445,6 +456,9 @@ class BridgeMostBridge:
                 # Stop any pending typing from previous bot
                 self._stop_typing(user)
                 user.active_bot = matched.name
+                # Persist selection so it survives restarts
+                if self._store:
+                    self._store.set_active_bot(user.telegram_id, matched.name)
                 await update.effective_message.reply_text(
                     f"── Ahora hablando con *{matched.name}* ──",
                     parse_mode="Markdown",
