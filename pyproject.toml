@@ -1,6 +1,6 @@
 [project]
 name = "bridgemost"
-version = "0.9.5"
+dynamic = ["version"]
 description = "Telegram ↔ Mattermost transparent bridge. Messages appear native."
 readme = "README.md"
 license = {text = "MIT"}
@@ -24,6 +24,9 @@ dependencies = [
 
 [project.scripts]
 bridgemost = "bridgemost.__main__:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "bridgemost.__version__"}
 
 [build-system]
 requires = ["setuptools>=68.0"]
