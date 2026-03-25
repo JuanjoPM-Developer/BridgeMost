@@ -1,6 +1,6 @@
 """Tests for bridge utility functions."""
 
-from bridgemost.bridge import split_message
+from bridgemost.adapters.telegram import split_message
 
 
 class TestSplitMessage:

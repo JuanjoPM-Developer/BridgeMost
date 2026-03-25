@@ -1,0 +1,461 @@
+"""Telegram adapter for BridgeMost.
+
+Handles all Telegram-specific logic: bot polling, message sending,
+media upload/download, reactions, typing indicators, /bot command.
+"""
+
+import asyncio
+import logging
+import tempfile
+from pathlib import Path
+
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    MessageReactionHandler,
+    filters,
+    ContextTypes,
+)
+
+from .base import BaseAdapter, InboundMessage, OutboundMessage
+
+logger = logging.getLogger("bridgemost.adapter.telegram")
+
+# Telegram message length limit
+TG_MAX_LENGTH = 4096
+
+
+def split_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
+    """Split a long message into chunks that fit Telegram's limit."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+        split_at = max_len
+        double_nl = remaining.rfind("\n\n", 0, max_len)
+        if double_nl > max_len // 2:
+            split_at = double_nl + 1
+        else:
+            single_nl = remaining.rfind("\n", 0, max_len)
+            if single_nl > max_len // 2:
+                split_at = single_nl + 1
+            else:
+                space = remaining.rfind(" ", 0, max_len)
+                if space > max_len // 2:
+                    split_at = space + 1
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    return chunks
+
+
+class TelegramAdapter(BaseAdapter):
+    """Telegram adapter using python-telegram-bot."""
+
+    def __init__(self, bot_token: str, allowed_user_ids: list[int] | None = None):
+        self._bot_token = bot_token
+        self._allowed_users = set(allowed_user_ids) if allowed_user_ids else None
+        self._app = None
+        self._bot = None
+        # Typing tasks per user
+        self._typing_tasks: dict[int, asyncio.Task] = {}
+        # Rate limiter: max 25 msgs/sec
+        from collections import deque
+        import time
+        self._send_times: deque[float] = deque(maxlen=25)
+        self._rate_limit = 25
+
+    async def start(self) -> None:
+        """Start Telegram bot polling."""
+        self._app = ApplicationBuilder().token(self._bot_token).build()
+        self._bot = self._app.bot
+
+        # Commands
+        self._app.add_handler(CommandHandler("bot", self._cmd_bot))
+        self._app.add_handler(CommandHandler("bots", self._cmd_bots))
+        self._app.add_handler(CommandHandler("status", self._cmd_status))
+
+        # Messages
+        self._app.add_handler(MessageHandler(
+            filters.ALL & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+            self._on_tg_message,
+        ))
+
+        # Edits
+        self._app.add_handler(MessageHandler(
+            filters.UpdateType.EDITED_MESSAGE,
+            self._on_tg_edit,
+        ))
+
+        # Reactions
+        self._app.add_handler(MessageReactionHandler(self._on_tg_reaction))
+
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling(drop_pending_updates=True, poll_interval=0.5)
+        logger.info("Telegram adapter started")
+
+    async def stop(self) -> None:
+        """Stop Telegram bot."""
+        # Cancel all typing tasks
+        for task in self._typing_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._typing_tasks.clear()
+
+        if self._app:
+            await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+        logger.info("Telegram adapter stopped")
+
+    def _is_allowed(self, tg_user_id: int) -> bool:
+        if not self._allowed_users:
+            return True
+        return tg_user_id in self._allowed_users
+
+    async def _rate_wait(self):
+        import time
+        now = time.monotonic()
+        if len(self._send_times) >= self._rate_limit:
+            oldest = self._send_times[0]
+            elapsed = now - oldest
+            if elapsed < 1.0:
+                await asyncio.sleep(1.0 - elapsed + 0.05)
+        self._send_times.append(time.monotonic())
+
+    # --- Inbound handlers ---
+
+    async def _on_tg_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming TG message → convert to InboundMessage → call core."""
+        msg = update.effective_message
+        if not msg or not update.effective_user:
+            return
+        if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._on_message:
+            return
+
+        inbound = InboundMessage(
+            platform_msg_id=msg.message_id,
+            user_id=update.effective_user.id,
+        )
+
+        # Download media to temp file
+        local_file = None
+        try:
+            if msg.photo:
+                photo = msg.photo[-1]
+                tg_file = await context.bot.get_file(photo.file_id)
+                local_file = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                await tg_file.download_to_drive(local_file.name)
+                inbound.file_path = local_file.name
+                inbound.file_name = f"photo_{photo.file_unique_id}.jpg"
+                inbound.file_mime = "image/jpeg"
+
+            elif msg.document:
+                tg_file = await context.bot.get_file(msg.document.file_id)
+                fname = msg.document.file_name or "file"
+                local_file = tempfile.NamedTemporaryFile(suffix=Path(fname).suffix or ".bin", delete=False)
+                await tg_file.download_to_drive(local_file.name)
+                inbound.file_path = local_file.name
+                inbound.file_name = fname
+                inbound.file_mime = msg.document.mime_type or ""
+
+            elif msg.audio or msg.voice:
+                audio = msg.audio or msg.voice
+                tg_file = await context.bot.get_file(audio.file_id)
+                suffix = ".ogg" if msg.voice else ".mp3"
+                local_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+                await tg_file.download_to_drive(local_file.name)
+                inbound.file_path = local_file.name
+                inbound.file_name = getattr(audio, "file_name", None) or f"audio{suffix}"
+                inbound.file_mime = "audio/ogg" if msg.voice else "audio/mpeg"
+                inbound.is_voice = bool(msg.voice)
+
+            elif msg.video or msg.video_note:
+                video = msg.video or msg.video_note
+                tg_file = await context.bot.get_file(video.file_id)
+                local_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+                await tg_file.download_to_drive(local_file.name)
+                inbound.file_path = local_file.name
+                inbound.file_name = getattr(video, "file_name", None) or "video.mp4"
+                inbound.file_mime = "video/mp4"
+
+            elif msg.sticker:
+                sticker = msg.sticker
+                inbound.sticker_emoji = sticker.emoji or ""
+                try:
+                    tg_file = await context.bot.get_file(sticker.file_id)
+                    if sticker.is_animated:
+                        suffix, fname = ".tgs", "sticker.tgs"
+                    elif sticker.is_video:
+                        suffix, fname = ".webm", "sticker.webm"
+                    else:
+                        suffix, fname = ".webp", "sticker.webp"
+                    local_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+                    await tg_file.download_to_drive(local_file.name)
+                    inbound.file_path = local_file.name
+                    inbound.file_name = fname
+                except Exception:
+                    pass  # Fallback: emoji only
+
+            elif msg.venue:
+                inbound.location = (msg.venue.location.latitude, msg.venue.location.longitude)
+                inbound.venue_name = msg.venue.title or ""
+                inbound.venue_address = msg.venue.address or ""
+
+            elif msg.location:
+                inbound.location = (msg.location.latitude, msg.location.longitude)
+
+            elif msg.poll:
+                inbound.poll_question = msg.poll.question
+                inbound.poll_options = [opt.text for opt in msg.poll.options]
+                inbound.poll_anonymous = msg.poll.is_anonymous
+                inbound.poll_multiple = msg.poll.allows_multiple_answers
+
+        except Exception as e:
+            logger.error("TG media download error: %s", e)
+
+        inbound.text = msg.text or msg.caption or ""
+        await self._on_message(inbound)
+
+    async def _on_tg_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle edited TG message."""
+        msg = update.edited_message
+        if not msg or not update.effective_user:
+            return
+        if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._on_edit:
+            return
+
+        inbound = InboundMessage(
+            platform_msg_id=msg.message_id,
+            user_id=update.effective_user.id,
+            text=msg.text or msg.caption or "",
+            is_edit=True,
+        )
+        await self._on_edit(inbound)
+
+    async def _on_tg_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle TG reaction changes."""
+        reaction_update = update.message_reaction
+        if not reaction_update or not reaction_update.user:
+            return
+        if not self._is_allowed(reaction_update.user.id):
+            return
+        if not self._on_reaction:
+            return
+
+        old_emojis = set()
+        for r in (reaction_update.old_reaction or []):
+            if hasattr(r, "emoji") and r.emoji:
+                old_emojis.add(r.emoji)
+
+        new_emojis = set()
+        for r in (reaction_update.new_reaction or []):
+            if hasattr(r, "emoji") and r.emoji:
+                new_emojis.add(r.emoji)
+
+        inbound = InboundMessage(
+            platform_msg_id=0,
+            user_id=reaction_update.user.id,
+            reaction_added=list(new_emojis - old_emojis) or None,
+            reaction_removed=list(old_emojis - new_emojis) or None,
+            reaction_msg_id=reaction_update.message_id,
+        )
+        await self._on_reaction(inbound)
+
+    # --- Commands ---
+
+    async def _cmd_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._on_command or not update.effective_user or not update.effective_message:
+            return
+        reply = await self._on_command("bot", context.args or [], update.effective_user.id)
+        if reply:
+            await update.effective_message.reply_text(reply, parse_mode="Markdown")
+
+    async def _cmd_bots(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._on_command or not update.effective_user or not update.effective_message:
+            return
+        reply = await self._on_command("bots", [], update.effective_user.id)
+        if reply:
+            await update.effective_message.reply_text(reply, parse_mode="Markdown")
+
+    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._on_command or not update.effective_user or not update.effective_message:
+            return
+        reply = await self._on_command("status", [], update.effective_user.id)
+        if reply:
+            await update.effective_message.reply_text(reply, parse_mode="Markdown")
+
+    # --- Outbound methods (called by core) ---
+
+    async def send_message(self, user_id, msg: OutboundMessage) -> int | None:
+        """Send message/file to TG user. Returns TG message_id."""
+        if not self._bot:
+            return None
+
+        sent_id = None
+
+        # Handle file sending with smart dispatch
+        if msg.file_path:
+            await self._rate_wait()
+            try:
+                mime = msg.file_mime or ""
+                ext = Path(msg.file_name).suffix.lower() if msg.file_name else ""
+
+                if mime.startswith("image/"):
+                    if mime == "image/gif" or ext == ".gif":
+                        with open(msg.file_path, "rb") as f:
+                            sent = await self._bot.send_animation(chat_id=user_id, animation=f, filename=msg.file_name)
+                    elif msg.file_size <= 10*1024*1024 and ext in (".jpg",".jpeg",".png",".webp"):
+                        with open(msg.file_path, "rb") as f:
+                            sent = await self._bot.send_photo(chat_id=user_id, photo=f, filename=msg.file_name)
+                    else:
+                        with open(msg.file_path, "rb") as f:
+                            sent = await self._bot.send_document(chat_id=user_id, document=f, filename=msg.file_name)
+                elif mime.startswith("audio/"):
+                    if ext == ".ogg" or mime == "audio/ogg":
+                        with open(msg.file_path, "rb") as f:
+                            sent = await self._bot.send_voice(chat_id=user_id, voice=f, filename=msg.file_name)
+                    else:
+                        with open(msg.file_path, "rb") as f:
+                            sent = await self._bot.send_audio(chat_id=user_id, audio=f, filename=msg.file_name)
+                elif mime.startswith("video/"):
+                    with open(msg.file_path, "rb") as f:
+                        sent = await self._bot.send_video(chat_id=user_id, video=f, filename=msg.file_name)
+                else:
+                    with open(msg.file_path, "rb") as f:
+                        sent = await self._bot.send_document(chat_id=user_id, document=f, filename=msg.file_name)
+
+                sent_id = sent.message_id if sent else None
+            except Exception as e:
+                logger.error("TG file send error: %s", e)
+
+        # Handle text
+        if msg.text:
+            from ..markdown import mm_to_telegram
+            chunks = split_message(msg.text)
+            for i, chunk in enumerate(chunks):
+                await self._rate_wait()
+                try:
+                    tg_text = mm_to_telegram(chunk)
+                    try:
+                        sent = await self._bot.send_message(
+                            chat_id=user_id, text=tg_text, parse_mode="MarkdownV2",
+                        )
+                    except Exception:
+                        sent = await self._bot.send_message(
+                            chat_id=user_id, text=chunk, parse_mode=None,
+                        )
+                    if i == 0 and sent:
+                        sent_id = sent.message_id
+                except Exception as e:
+                    logger.error("TG send error: %s", e)
+
+        return sent_id
+
+    async def send_typing(self, user_id) -> None:
+        """Send/refresh typing indicator."""
+        if self._bot:
+            try:
+                await self._bot.send_chat_action(chat_id=user_id, action="typing")
+            except Exception:
+                pass
+
+    async def edit_message(self, user_id, platform_msg_id, new_text: str) -> bool:
+        if not self._bot:
+            return False
+        try:
+            from ..markdown import mm_to_telegram
+            tg_text = mm_to_telegram(new_text)
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=user_id, message_id=platform_msg_id,
+                    text=tg_text, parse_mode="MarkdownV2",
+                )
+            except Exception:
+                await self._bot.edit_message_text(
+                    chat_id=user_id, message_id=platform_msg_id, text=new_text,
+                )
+            return True
+        except Exception as e:
+            logger.error("TG edit error: %s", e)
+            return False
+
+    async def delete_message(self, user_id, platform_msg_id) -> bool:
+        if not self._bot:
+            return False
+        try:
+            await self._bot.delete_message(chat_id=user_id, message_id=platform_msg_id)
+            return True
+        except Exception as e:
+            logger.error("TG delete error: %s", e)
+            return False
+
+    async def set_reaction(self, user_id, platform_msg_id, emoji: str) -> bool:
+        if not self._bot:
+            return False
+        try:
+            await self._bot.set_message_reaction(
+                chat_id=user_id, message_id=platform_msg_id,
+                reaction=[{"type": "emoji", "emoji": emoji}],
+            )
+            return True
+        except Exception as e:
+            logger.error("TG set_reaction error: %s", e)
+            return False
+
+    async def clear_reactions(self, user_id, platform_msg_id) -> bool:
+        if not self._bot:
+            return False
+        try:
+            await self._bot.set_message_reaction(
+                chat_id=user_id, message_id=platform_msg_id, reaction=[],
+            )
+            return True
+        except Exception as e:
+            logger.error("TG clear_reaction error: %s", e)
+            return False
+
+    async def send_raw_text(self, user_id: int, text: str) -> None:
+        """Send a plain text message (for system notifications like PAT expiry)."""
+        if self._bot:
+            try:
+                await self._bot.send_message(chat_id=user_id, text=text)
+            except Exception:
+                pass
+
+    # --- Typing management ---
+
+    def start_typing_loop(self, user_id: int, timeout: float = 60.0):
+        """Start a persistent typing indicator loop."""
+        self.stop_typing_loop(user_id)
+        task = asyncio.create_task(self._typing_loop(user_id, timeout))
+        self._typing_tasks[user_id] = task
+
+    def stop_typing_loop(self, user_id: int):
+        """Cancel the typing loop for a user."""
+        task = self._typing_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _typing_loop(self, user_id: int, max_duration: float = 60.0):
+        try:
+            elapsed = 0.0
+            while elapsed < max_duration:
+                await self.send_typing(user_id)
+                await asyncio.sleep(4.0)
+                elapsed += 4.0
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
