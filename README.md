@@ -1,12 +1,24 @@
 # BridgeMost 👻
 
 [![CI](https://github.com/JuanjoPM-Developer/BridgeMost/actions/workflows/ci.yml/badge.svg)](https://github.com/JuanjoPM-Developer/BridgeMost/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/bridgemost)](https://pypi.org/project/bridgemost/)
 
-**Telegram ↔ Mattermost Transparent Bridge**
+**Multi-Platform ↔ Mattermost Transparent Bridge**
 
-BridgeMost makes your Telegram messages appear **natively** in Mattermost — as your real user, with your avatar and name. Bot responses relay back to Telegram instantly via WebSocket.
+BridgeMost makes your messages from **any chat platform** appear **natively** in Mattermost — as your real user, with your avatar and name. Bot responses relay back instantly via WebSocket.
 
-Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost posts as **your actual Mattermost account**. Nobody in Mattermost can tell you're writing from Telegram.
+Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost posts as **your actual Mattermost account**. Nobody in Mattermost can tell you're writing from another platform.
+
+## 🔌 Supported Platforms (Adapters)
+
+| Platform | Status | Description |
+|----------|--------|-------------|
+| **Telegram** | ✅ Production | Full support — text, media, voice, reactions, edits, deletes |
+| **Google Chat** | 🔜 Planned | Workspace ghost mode via Service Account |
+| **Slack** | 🔜 Planned | User token impersonation |
+| **Matrix** | 🔜 Planned | Application Service ghost mode |
+
+> **Plugin architecture (v2.0+):** Each platform is an independent adapter module. Adding a new platform = one Python file implementing `BaseAdapter`. Zero changes to the core engine.
 
 ## ✨ Features
 
@@ -15,33 +27,56 @@ Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost pos
 | 🪪 Transparent identity | Posts as your real MM user (avatar, name, everything) |
 | 📁 Full media | Photos, documents, audio, video, voice — bidirectional |
 | 🎤 Voice-to-text | Voice messages auto-transcribed via Whisper API |
-| 🤖 Multi-bot routing | Talk to multiple bots; switch with `/bot name` |
+| 🤖 Multi-bot routing | Talk to multiple MM bots; switch with `/bot name` |
 | ⚡ Real-time WebSocket | Responses arrive instantly (no polling) |
 | ✏️ Edit & delete sync | Edits and deletes stay in sync both ways |
-| 😀 Reactions | Emoji reactions synced between TG and MM |
-| ⌨️ Typing indicator | "Bot is typing..." shown in Telegram |
-| 📝 Markdown | MM markdown → Telegram MarkdownV2 auto-conversion |
+| 😀 Reactions | Emoji reactions synced bidirectionally |
+| ⌨️ Typing indicator | Synthetic "Bot is typing..." on the chat side |
+| 📝 Markdown | MM markdown auto-converted to platform format |
 | 🔒 Startup checks | Validates tokens + discovers channels before starting |
 | 💾 Persistent mapping | SQLite store for message IDs (survives restarts) |
 | 🩺 Health endpoint | HTTP `/health` on configurable port |
-
-| 👥 Multi-user | Multiple Telegram users, each with their own MM identity |
+| 👥 Multi-user | Multiple users, each with their own identity and bot routing |
+| 🐳 Docker | Multi-stage image, ~55 MB |
 
 ~55 MB RAM · ~250 ms latency · asyncio-based · Python 3.11+
 
-> **Multi-user ready:** Multiple people can use the same BridgeMost instance — each with their own Telegram account, Mattermost identity, and bot routing. Add users to `config.yaml` and they appear as themselves in Mattermost. No shared accounts, no impersonation.
+> **Multi-user ready:** Multiple people can use the same BridgeMost instance — each with their own chat account, Mattermost identity, and bot routing. Add users to `config.yaml` and they appear as themselves in Mattermost. No shared accounts, no impersonation.
+
+---
+
+## 🏗️ Architecture (v2.0+)
+
+```
+┌──────────────┐
+│   Telegram   │─┐
+├──────────────┤ │         ┌──────────────┐         ┌──────────────┐
+│ Google Chat  │─┼────────►│  BridgeMost  │◄───────►│  Mattermost  │
+├──────────────┤ │         │  Core Engine  │  WS+API │   (Bots)     │
+│    Slack     │─┤         └──────────────┘         └──────────────┘
+├──────────────┤ │          Adapters │ Core │ MM
+│    Matrix    │─┘
+└──────────────┘
+```
+
+Three layers:
+1. **Adapters** — Platform-specific plugins (`telegram.py`, `googlechat.py`, etc.)
+2. **Core Engine** — Routing, mapping, sync, retry, health — platform-agnostic
+3. **Mattermost Connector** — WebSocket, REST API, file upload
+
+Each adapter implements `BaseAdapter` (8 methods: start, stop, send_message, edit, delete, react, typing, clear_reactions).
 
 ---
 
 ## 🚀 Installation — Step by Step
 
-### What you need before starting
+### What you need
 
 | # | Item | Where to get it |
 |---|------|----------------|
 | 1 | **Mattermost server** (self-hosted) | You must be admin or have an admin enable PAT support |
-| 2 | **Telegram bot token** | Create via [@BotFather](https://t.me/BotFather) → `/newbot` |
-| 3 | **Your Telegram user ID** | Send any message to [@userinfobot](https://t.me/userinfobot) — it replies with your numeric ID |
+| 2 | **Chat platform bot token** | Telegram: [@BotFather](https://t.me/BotFather) → `/newbot` |
+| 3 | **Your platform user ID** | Telegram: message [@userinfobot](https://t.me/userinfobot) |
 | 4 | **Python 3.11+** | `python3 --version` to check |
 | 5 | **Git** | `git --version` to check |
 
@@ -76,9 +111,19 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+Or via PyPI:
+```bash
+pip install bridgemost
+```
+
+Or via Docker:
+```bash
+docker compose up -d
+```
+
 ### Step 3 — Configure
 
-**Option A — Interactive wizard (recommended):**
+**Option A — Interactive wizard (recommended for Telegram):**
 
 ```bash
 python3 -m bridgemost setup
@@ -89,7 +134,7 @@ The wizard will:
 2. Log you in (password is NOT stored)
 3. Auto-create a Personal Access Token for BridgeMost
 4. List all bots on the server — you pick which ones to bridge
-5. Ask for your Telegram bot token and user ID
+5. Ask for your platform bot token and user ID
 6. Generate `config.yaml` automatically
 
 **Option B — Manual configuration:**
@@ -98,7 +143,7 @@ The wizard will:
 cp config.example.yaml config.yaml
 ```
 
-Then edit `config.yaml` — see the [Configuration Reference](#-configuration-reference) below for each field.
+Then edit `config.yaml` — see the [Configuration Reference](#-configuration-reference) below.
 
 ### Step 4 — Run
 
@@ -115,15 +160,15 @@ sudo systemctl enable --now bridgemost
 
 ### Step 5 — Test
 
-1. Open Telegram and send a message to your BridgeMost bot
+1. Send a message from your chat platform to the BridgeMost bot
 2. The message should appear in Mattermost as **your real user**
-3. When the MM bot responds, the response should appear in your Telegram chat
+3. When the MM bot responds, the response should appear in your chat
 
 ---
 
 ## ⚙️ Configuration Reference
 
-### Minimal config.yaml
+### Minimal config.yaml (Telegram adapter)
 
 ```yaml
 telegram:
@@ -135,7 +180,7 @@ mattermost:
   bot_user_id: "a1b2c3d4..."            # User ID of that bot
 
 users:
-  - telegram_id: 123456789              # Your numeric Telegram user ID
+  - telegram_id: 123456789              # Your numeric platform user ID
     telegram_name: "Your Name"           # Display name (for logs only)
     mm_user_id: "x1y2z3..."             # Your Mattermost user ID
     mm_token: "your-pat-here"           # Your Personal Access Token
@@ -154,11 +199,11 @@ users:
 | `telegram_id` | Send any message to [@userinfobot](https://t.me/userinfobot) |
 | `mattermost.url` | The URL you use to open Mattermost in your browser |
 | `mattermost.bot_token` | MM → Integrations → Bot Accounts → pick any bot → copy token. Or ask your admin. |
-| `mattermost.bot_user_id` | Run: `mmctl user search <botname>` → copy the `id` field. Or: `curl http://YOUR_MM/api/v4/users/username/<botname> -H "Authorization: Bearer TOKEN"` → `"id"` field |
-| `mm_user_id` | Same as above but with your own username instead of the bot's |
-| `mm_token` (PAT) | MM → click your avatar → Profile → Security → Personal Access Tokens → Create. Or the setup wizard creates it for you. |
-| `mm_bot_id` | Same method as `bot_user_id` — the Mattermost user ID of the bot you want to talk to |
-| `mm_dm_channel` | **Leave empty** — BridgeMost discovers it automatically. Only fill in if auto-discovery fails (check logs). |
+| `mattermost.bot_user_id` | `mmctl user search <botname>` → copy `id`. Or: `curl http://YOUR_MM/api/v4/users/username/<botname> -H "Authorization: Bearer TOKEN"` → `"id"` |
+| `mm_user_id` | Same as above with your own username |
+| `mm_token` (PAT) | MM → Profile → Security → Personal Access Tokens → Create. Or wizard creates it. |
+| `mm_bot_id` | The Mattermost user ID of each bot you want to talk to |
+| `mm_dm_channel` | **Leave empty** — auto-discovered at startup. |
 
 ### Optional sections
 
@@ -187,16 +232,14 @@ logging:
 
 ---
 
-## 🤖 Telegram Commands
+## 🤖 Chat Commands (Telegram adapter)
 
 | Command | Description |
 |---------|-------------|
 | `/bot` | List all available bots and show which one is active |
 | `/bot name` | Switch to a different bot |
 | `/bots` | Show all bots with live 🟢/⚫ online status |
-| `/status` | Detailed info about the active bot (state, last message, store stats) |
-
-Just type normally to send messages — commands are only for bot management.
+| `/status` | Detailed info about the active bot |
 
 ---
 
@@ -225,7 +268,7 @@ curl http://localhost:9191/health
 ```json
 {
   "status": "ok",
-  "version": "0.9.5",
+  "version": "2.0.1",
   "transport": "websocket",
   "uptime": "2h15m30s",
   "messages": { "tg_to_mm": 42, "mm_to_tg": 38, "errors": 0 },
@@ -235,71 +278,73 @@ curl http://localhost:9191/health
 
 ---
 
-## 🏗️ Architecture
-
-```
-┌──────────┐              ┌──────────────┐              ┌──────────────┐
-│ Telegram │◄────────────►│  BridgeMost  │◄────────────►│  Mattermost  │
-│  (User)  │  Bot API     │   (Bridge)   │  REST + WS   │  (Bots)      │
-└──────────┘              └──────────────┘              └──────────────┘
-```
-
-1. **TG → MM**: User sends via Telegram → BridgeMost posts to MM using the user's PAT (appears as real user)
-2. **MM → TG**: Bot responds → WebSocket delivers event instantly → BridgeMost relays to Telegram
-3. **Edits/Deletes/Reactions**: Tracked via bidirectional message ID mapping (SQLite-backed, 30-day TTL)
-
----
-
 ## 🔧 Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| `FATAL: Token validation FAILED` | Your PAT is invalid or expired. Create a new one in MM → Profile → Security → Personal Access Tokens. Also verify `EnableUserAccessTokens` is `true` in System Console. |
-| `⚠️ Tu token de Mattermost ha expirado` (Telegram alert) | Same as above — renew the PAT and update `mm_token` in config.yaml, then restart. |
-| `Zero DM channels discovered` | BridgeMost couldn't find any DM channel with the configured bots. Make sure you have sent at least one DM to each bot in Mattermost before starting. The `mm_bot_id` values must be correct user IDs (26 alphanumeric characters). |
-| `WS auth rejected (CLOSE on connect)` | The `mattermost.bot_token` is invalid. Get a valid bot token from Integrations → Bot Accounts. |
-| `OSError: [Errno 98] address already in use` (health port) | Another process is using the health port (default 9191). Change `health.port` in config or stop the conflicting service. |
-| Messages arrive but with `[BotName]` prefix | This is normal in multi-bot mode — it identifies which bot sent the response. With a single bot, no prefix is added. |
-| Voice messages not transcribed | Check that `voice_to_text.url` is reachable: `curl http://YOUR_WHISPER_URL/asr`. For OpenAI/Groq, verify `api_key` is set. |
-| `EnableUserAccessTokens` keeps turning off | Something (another admin, a script, or a bot) is toggling it. Set it permanently and check who has access to System Console. |
-| Bridge starts but no messages relay | Check logs (`journalctl -u bridgemost -f`). Common causes: wrong `telegram_id` (messages from unknown users are silently ignored), bot not yet DM'd in MM, or firewall blocking MM API. |
+| `FATAL: Token validation FAILED` | PAT is invalid/expired. Create a new one in MM → Profile → Security → PAT. Also verify `EnableUserAccessTokens` is `true`. |
+| `⚠️ Token expirado` alert | Same — renew PAT, update `mm_token` in config.yaml, restart. |
+| `Zero DM channels discovered` | Make sure you've DM'd each bot in MM at least once. Verify `mm_bot_id` values are correct (26 alphanumeric chars). |
+| `WS auth rejected (CLOSE on connect)` | The `mattermost.bot_token` is invalid. Get a valid one from Integrations → Bot Accounts. |
+| `OSError: [Errno 98] address already in use` | Another process on health port. Change `health.port` in config. |
+| `[BotName]` prefix on messages | Normal in multi-bot mode to identify which bot responded. Single bot = no prefix. |
+| Voice not transcribed | Check `voice_to_text.url` is reachable. For OpenAI/Groq, verify `api_key`. |
+| `EnableUserAccessTokens` keeps resetting | Something is toggling it. Lock the setting and audit admin access. |
 
 ---
 
-## 🛡️ Security Notes
+## 🛡️ Security
 
 - **`config.yaml` contains secrets** — it's in `.gitignore`, never commit it
-- Personal Access Tokens have your full user permissions — use a dedicated account if concerned
-- Health endpoint binds to `127.0.0.1` by default (not exposed externally)
-- Only Telegram users whose `telegram_id` is in config can use the bridge
-- Message ID mappings stored in SQLite (local disk only, 30-day auto-prune)
+- PATs have your full user permissions — use a dedicated account if concerned
+- Health endpoint binds to `127.0.0.1` (not exposed externally)
+- Only users whose ID is in config can use the bridge
+- Message mappings stored in local SQLite (30-day auto-prune)
+
+---
+
+## 🔌 Writing a Custom Adapter
+
+Create a new file in `src/bridgemost/adapters/` that implements `BaseAdapter`:
+
+```python
+from bridgemost.adapters.base import BaseAdapter, InboundMessage, OutboundMessage
+
+class MyPlatformAdapter(BaseAdapter):
+    async def start(self): ...
+    async def stop(self): ...
+    async def send_message(self, chat_id, msg: OutboundMessage) -> int | None: ...
+    async def edit_message(self, chat_id, msg_id, text): ...
+    async def delete_message(self, chat_id, msg_id): ...
+    async def set_reaction(self, chat_id, msg_id, emoji): ...
+    async def clear_reactions(self, chat_id, msg_id): ...
+    def start_typing_loop(self, chat_id): ...
+    def stop_typing_loop(self, chat_id): ...
+```
+
+The core engine handles all Mattermost interaction, message tracking, retry, and health monitoring.
 
 ---
 
 ## 📋 Changelog
 
-| Version | Date | Feature |
-|---------|------|---------|
-| v0.9.5 | 2026-03-25 | Fix NameError in whisper.py finally block (GitHub #1), version alignment |
-| v0.9.4 | 2026-03-25 | Smart MM→TG file relay with MIME dispatch (photo/gif/audio/voice/video) |
-| v0.9.3 | 2026-03-24 | Audit fix: 3 bugs in sticker/location/poll handlers |
-| v0.9.2 | 2026-03-24 | Stickers, locations, venues, polls — TG→MM |
-| v0.9.1 | 2026-03-25 | Multi-user highlighted in README, unit tests added |
-| v0.9.0 | 2026-03-24 | README rewrite, improved config.example.yaml with inline docs |
-| v0.8.3 | 2026-03-24 | Code audit cleanup (dead code, unused imports, version alignment) |
-| v0.8.2 | 2026-03-24 | Remove `/ping` (ghost typing fix), typing timeout 300→60s |
-| v0.8.1 | 2026-03-24 | `/bots` and `/status` Telegram commands |
-| v0.8.0 | 2026-03-24 | SQLite persistent store, WS reconnect jitter, TG rate limiter |
-| v0.7.0 | 2026-03-24 | 7-bug audit fix (voice handler, file leak, typing timeout, PAT expiry) |
-| v0.6.0 | 2026-03-24 | Interactive setup wizard (`bridgemost setup`) |
-| v0.5.0 | 2026-03-24 | Startup resilience — token validation, DM retry, zero-channel abort |
-| v0.4.0 | 2026-03-24 | Voice-to-text via Whisper API |
-| v0.3.1 | 2026-03-24 | Synthetic typing indicator |
-| v0.3.0 | 2026-03-24 | Multi-bot routing with `/bot` command |
+| Version | Date | Highlight |
+|---------|------|-----------|
+| v2.0.1 | 2026-03-25 | Audit cleanup: platform-agnostic emoji names, encapsulation fix |
+| v2.0.0 | 2026-03-25 | **Plugin adapter architecture** — Telegram extracted as adapter, core engine separated |
+| v1.0.0 | 2026-03-25 | **Stable release** — PyPI, CI/CD, full test suite |
+| v0.9.x | 2026-03-24/25 | Stickers, locations, polls, file relay, Docker, 71 tests |
+| v0.8.x | 2026-03-24 | SQLite store, WS jitter, rate limiter, bot commands |
+| v0.7.0 | 2026-03-24 | 7-bug audit, PAT health check, error alerts |
+| v0.6.0 | 2026-03-24 | Interactive setup wizard |
+| v0.5.0 | 2026-03-24 | Startup resilience, token validation |
+| v0.4.0 | 2026-03-24 | Voice-to-text via Whisper |
+| v0.3.x | 2026-03-24 | Multi-bot routing, synthetic typing |
 | v0.2.0 | 2026-03-24 | Emoji/reaction relay |
-| v0.1.1 | 2026-03-24 | Edit and delete sync (bidirectional) |
-| v0.1.0 | 2026-03-24 | WebSocket transport (replaced polling) |
+| v0.1.x | 2026-03-24 | WebSocket transport, edit/delete sync |
 | v0.0.5 | 2026-03-24 | First public release |
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
 
@@ -309,5 +354,5 @@ MIT — see [LICENSE](LICENSE)
 
 ## 🙏 Built with
 
-- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
-- [aiohttp](https://github.com/aio-libs/aiohttp)
+- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) (Telegram adapter)
+- [aiohttp](https://github.com/aio-libs/aiohttp) (MM WebSocket + HTTP)
