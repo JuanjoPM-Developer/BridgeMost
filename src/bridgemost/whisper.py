@@ -47,42 +47,43 @@ class WhisperClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
-            fh = open(audio_path, "rb")  # noqa: SIM115
-            data = aiohttp.FormData()
-            data.add_field(
-                "file",
-                fh,
-                filename=path.name,
-                content_type=_guess_mime(path.suffix),
-            )
-            data.add_field("model", self.model)
-            if self.language:
-                data.add_field("language", self.language)
-            data.add_field("response_format", "json")
+            with open(audio_path, "rb") as fh:
+                data = aiohttp.FormData()
+                data.add_field(
+                    "file",
+                    fh,
+                    filename=path.name,
+                    content_type=_guess_mime(path.suffix),
+                )
+                data.add_field("model", self.model)
+                if self.language:
+                    data.add_field("language", self.language)
+                data.add_field("response_format", "json")
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    endpoint, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=120)
-                ) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        logger.error(
-                            "Whisper API error %d: %s", resp.status, body[:200]
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        endpoint, data=data, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=120),
+                    ) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.error(
+                                "Whisper API error %d: %s", resp.status, body[:200]
+                            )
+                            return None
+
+                        result = await resp.json()
+                        text = result.get("text", "").strip()
+
+                        if not text:
+                            logger.warning("Whisper returned empty transcription")
+                            return None
+
+                        logger.info(
+                            "Transcribed %s (%d bytes) → %d chars",
+                            path.name, path.stat().st_size, len(text),
                         )
-                        return None
-
-                    result = await resp.json()
-                    text = result.get("text", "").strip()
-
-                    if not text:
-                        logger.warning("Whisper returned empty transcription")
-                        return None
-
-                    logger.info(
-                        "Transcribed %s (%d bytes) → %d chars",
-                        path.name, path.stat().st_size, len(text),
-                    )
-                    return text
+                        return text
 
         except aiohttp.ClientError as exc:
             logger.error("Whisper connection error: %s", exc)
@@ -93,11 +94,6 @@ class WhisperClient:
         except Exception:
             logger.exception("Unexpected Whisper error")
             return None
-        finally:
-            try:
-                fh.close()
-            except Exception:
-                pass
 
 
 def _guess_mime(suffix: str) -> str:
