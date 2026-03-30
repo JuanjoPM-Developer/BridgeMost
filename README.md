@@ -28,6 +28,7 @@ Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost pos
 | 📁 Full media | Photos, documents, audio, video, voice — bidirectional |
 | 🎤 Voice-to-text | Voice messages auto-transcribed via Whisper API |
 | 🤖 Multi-bot routing | Talk to multiple MM bots; switch with `/bot name` |
+| 📲 DM Bridge mode | Give each MM bot its own dedicated TG bot — DM it directly (v2.2.0) |
 | ⚡ Real-time WebSocket | Responses arrive instantly (no polling) |
 | ✏️ Edit & delete sync | Edits and deletes stay in sync both ways |
 | 😀 Reactions | Emoji reactions synced bidirectionally |

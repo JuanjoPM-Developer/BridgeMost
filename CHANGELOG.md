@@ -2,6 +2,27 @@
 
 All notable changes to BridgeMost are documented here.
 
+## v2.2.0 (2026-03-30)
+
+### Added
+- **DM Bridge mode** — dedicated TG bot per MM bot, direct 1:1 bridging
+  - New `DmBridge` dataclass in `config.py` with `tg_bot_token`, `mm_bot_id`, `name`
+  - New `dm_bridges:` config section (optional; inherits user mappings from `users:`)
+  - New `DmBridgeRelay` class in `core.py` — one instance per `dm_bridge` entry
+    - Each relay polls its own TG bot token (separate `TelegramAdapter` instance)
+    - Discovers DM channel(s) between configured users and the target MM bot
+    - Bidirectional relay: TG DM → MM DM channel, MM bot response → TG DM
+    - Full feature parity: media, edits, deletes, reactions, voice-to-text, typing indicators
+    - Per-relay SQLite store (`dm_<name>.db`) to avoid ID conflicts with main relay
+  - `__main__.py` instantiates `DmBridgeRelay` instances and runs them via `asyncio.gather`
+  - Graceful shutdown propagates `_running = False` to all relays
+  - Health endpoint (`/health`) now includes `dm_bridges` array with per-relay stats
+  - `config.example.yaml`: documented `dm_bridges:` section with inline comments
+
+### Changed
+- `__init__.py`: version bumped to `2.2.0`
+- Startup log line includes DM bridge count
+
 ## v2.1.0 (2026-03-25)
 
 ### Added

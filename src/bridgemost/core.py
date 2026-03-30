@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 from .adapters.base import BaseAdapter, InboundMessage, OutboundMessage
-from .config import Config, UserMapping
+from .config import Config, DmBridge, UserMapping
 from .emoji import unicode_to_mm, mm_to_unicode
 from .health import HealthServer
 from .mattermost import MattermostClient
@@ -584,6 +584,498 @@ class BridgeMostCore:
             last_error = result
             if attempt == max_retries - 1:
                 logger.error("MM post failed after %d retries: %s", max_retries, last_error)
+                await self.adapter.send_message(
+                    user.telegram_id,
+                    OutboundMessage(text=f"⚠️ Mensaje no entregado: {last_error.get('message', 'error')}"),
+                )
+                return last_error
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10.0)
+        return last_error
+
+
+class DmBridgeRelay:
+    """Dedicated DM bridge: one TG bot ↔ one MM bot's DM channel per user.
+
+    Each relay instance polls its own Telegram bot token and subscribes to the
+    MM DM channel between each configured user and the target MM bot.
+    No bot-switching commands — the bridge is fixed.
+    """
+
+    def __init__(self, config: Config, bridge: DmBridge):
+        from .adapters.telegram import TelegramAdapter
+
+        self.config = config
+        self.bridge = bridge
+
+        allowed_ids = [u.telegram_id for u in config.users] if config.users else None
+        self.adapter = TelegramAdapter(
+            bot_token=bridge.tg_bot_token,
+            allowed_user_ids=allowed_ids,
+        )
+        self.mm = MattermostClient(config.mm_url)
+
+        db_name = f"dm_{bridge.name}.db"
+        db_path = Path(config.data_dir) / db_name if config.data_dir else Path(db_name)
+        self._store = MessageStore(db_path)
+
+        self._tg_to_mm: dict[int, str] = {}
+        self._mm_to_tg: dict[str, int] = {}
+        self._map_maxlen = 5000
+        self._our_post_ids: list[str] = []
+        self._our_post_maxlen = 1000
+
+        # channel_id → UserMapping for this relay's DM channels
+        self._dm_to_user: dict[str, UserMapping] = {}
+
+        self._ws: MattermostWebSocket | None = None
+        self._running = False
+
+        self.whisper: WhisperClient | None = None
+        if config.whisper_url:
+            self.whisper = WhisperClient(
+                url=config.whisper_url,
+                api_key=config.whisper_api_key,
+                model=config.whisper_model,
+                language=config.whisper_language,
+            )
+
+        # Stats for health reporting
+        self._stats = {"tg_to_mm": 0, "mm_to_tg": 0, "errors": 0}
+
+    def stats_snapshot(self) -> dict:
+        """Return current stats for health reporting."""
+        return {
+            "name": self.bridge.name,
+            "tg_to_mm": self._stats["tg_to_mm"],
+            "mm_to_tg": self._stats["mm_to_tg"],
+            "errors": self._stats["errors"],
+            "channels": len(self._dm_to_user),
+        }
+
+    # --- Message tracking ---
+
+    def _track_pair(self, platform_id: int, mm_id: str, chat_id: int = 0):
+        self._tg_to_mm[platform_id] = mm_id
+        self._mm_to_tg[mm_id] = platform_id
+        if len(self._tg_to_mm) > self._map_maxlen:
+            oldest = next(iter(self._tg_to_mm))
+            self._mm_to_tg.pop(self._tg_to_mm.pop(oldest), None)
+        self._store.put(platform_id, mm_id, chat_id)
+
+    def _lookup_mm(self, platform_id: int) -> str | None:
+        mm_id = self._tg_to_mm.get(platform_id)
+        if mm_id:
+            return mm_id
+        mm_id = self._store.get_mm(platform_id)
+        if mm_id:
+            self._tg_to_mm[platform_id] = mm_id
+            self._mm_to_tg[mm_id] = platform_id
+        return mm_id
+
+    def _lookup_platform(self, mm_id: str) -> int | None:
+        p_id = self._mm_to_tg.get(mm_id)
+        if p_id:
+            return p_id
+        p_id = self._store.get_tg(mm_id)
+        if p_id:
+            self._mm_to_tg[mm_id] = p_id
+            self._tg_to_mm[p_id] = mm_id
+        return p_id
+
+    def _mark_our_post(self, post_id: str):
+        self._our_post_ids.append(post_id)
+        if len(self._our_post_ids) > self._our_post_maxlen:
+            self._our_post_ids = self._our_post_ids[-self._our_post_maxlen:]
+
+    # --- Lifecycle ---
+
+    async def start(self):
+        """Start this DM bridge relay."""
+        from . import __version__
+        logger.info(
+            "DmBridgeRelay '%s' v%s starting (mm_bot_id=%s)...",
+            self.bridge.name, __version__, self.bridge.mm_bot_id,
+        )
+
+        self._store.open()
+
+        # Validate tokens and discover DM channels for each configured user
+        for user in self.config.users:
+            info = await self.mm.validate_token(user.mm_token)
+            if not info:
+                logger.critical(
+                    "DmBridge '%s': Token validation FAILED for %s",
+                    self.bridge.name, user.telegram_name,
+                )
+                await self.mm.close()
+                self._store.close()
+                raise SystemExit(1)
+
+            for attempt in range(3):
+                channel = await self.mm.get_dm_channel(
+                    user.mm_token, user.mm_user_id, self.bridge.mm_bot_id
+                )
+                if channel:
+                    self._dm_to_user[channel] = user
+                    logger.info(
+                        "DmBridge '%s': channel discovered %s→%s: %s",
+                        self.bridge.name, user.telegram_name, self.bridge.mm_bot_id, channel,
+                    )
+                    break
+                await asyncio.sleep(2.0 * (attempt + 1))
+
+        if not self._dm_to_user:
+            logger.critical(
+                "DmBridge '%s': Zero DM channels discovered — nothing to relay",
+                self.bridge.name,
+            )
+            await self.mm.close()
+            self._store.close()
+            raise SystemExit(1)
+
+        # Wire adapter callbacks (no command handler — DM mode is fixed-target)
+        self.adapter.set_callbacks(
+            on_message=self._handle_inbound_message,
+            on_edit=self._handle_inbound_edit,
+            on_reaction=self._handle_inbound_reaction,
+            on_command=self._handle_command,
+        )
+
+        await self.adapter.start()
+
+        # WebSocket using first user's token
+        ws_url = self.config.mm_url.replace("https://", "wss://").replace("http://", "ws://")
+        self._ws = MattermostWebSocket(
+            ws_url=ws_url,
+            token=self.config.users[0].mm_token,
+            on_post=self._handle_ws_post,
+            on_post_edited=self._handle_ws_edit,
+            on_post_deleted=self._handle_ws_delete,
+            on_reaction_added=self._handle_ws_reaction_added,
+            on_reaction_removed=self._handle_ws_reaction_removed,
+            on_typing=self._handle_ws_typing,
+        )
+        await self._ws.start()
+
+        logger.info(
+            "DmBridgeRelay '%s' active — %d channel(s)",
+            self.bridge.name, len(self._dm_to_user),
+        )
+
+        self._running = True
+        try:
+            while self._running:
+                await asyncio.sleep(1)
+        finally:
+            self._running = False
+            if self._ws:
+                await self._ws.stop()
+            await self.adapter.stop()
+            await self.mm.close()
+            self._store.close()
+
+    # --- Commands (DM bridges are fixed-target; commands are no-ops) ---
+
+    async def _handle_command(self, cmd: str, args: list[str], user_id) -> str | None:
+        """DM bridges have no bot-switching; inform the user."""
+        return f"ℹ️ DM bridge *{self.bridge.name}* — fixed target, no commands needed."
+
+    # --- Inbound (TG → MM) ---
+
+    async def _handle_inbound_message(self, msg: InboundMessage):
+        """Process a message from TG → post to this bridge's MM bot DM."""
+        user = self.config.get_user_by_tg_id(msg.user_id)
+        if not user:
+            return
+
+        dm = next((ch for ch, u in self._dm_to_user.items() if u.mm_user_id == user.mm_user_id), None)
+        if not dm:
+            return
+
+        self._stats["tg_to_mm"] += 1
+
+        file_ids = []
+        text = msg.text
+        voice_prefix = ""
+
+        if msg.file_path:
+            fid = await self.mm.upload_file(user.mm_token, dm, msg.file_path, msg.file_name)
+            if fid:
+                file_ids.append(fid)
+
+        if msg.is_voice and msg.file_path and self.whisper:
+            try:
+                transcript = await self.whisper.transcribe(msg.file_path)
+                if transcript:
+                    voice_prefix = f"🎤 {transcript}"
+            except Exception as e:
+                logger.error("DmBridge '%s' whisper error: %s", self.bridge.name, e)
+
+        if msg.location:
+            lat, lon = msg.location
+            map_url = f"https://www.google.com/maps?q={lat},{lon}"
+            if msg.venue_name:
+                loc = f"📍 {msg.venue_name}"
+                if msg.venue_address:
+                    loc += f" — {msg.venue_address}"
+                loc += f"\n[Ver en mapa]({map_url})"
+            else:
+                loc = f"📍 Ubicación: [{lat}, {lon}]({map_url})"
+            text = f"{text}\n{loc}" if text else loc
+
+        if msg.poll_question:
+            poll_text = f"📊 **{msg.poll_question}**\n"
+            for i, opt in enumerate(msg.poll_options or []):
+                poll_text += f"  {i+1}. {opt}\n"
+            meta = []
+            if msg.poll_anonymous:
+                meta.append("Anónima")
+            if msg.poll_multiple:
+                meta.append("Múltiple respuesta")
+            if meta:
+                poll_text += f"_{' · '.join(meta)}_"
+            text = f"{text}\n{poll_text}" if text else poll_text
+
+        if msg.sticker_emoji and not text and not file_ids:
+            text = msg.sticker_emoji
+
+        if voice_prefix:
+            text = f"{voice_prefix}\n{text}" if text else voice_prefix
+
+        if msg.file_path:
+            try:
+                Path(msg.file_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        if text or file_ids:
+            result = await self._retry_mm_post(user, dm, text, file_ids or None)
+            post_id = result.get("id")
+            if post_id:
+                self._mark_our_post(post_id)
+                self._track_pair(msg.platform_msg_id, post_id)
+                self.adapter.start_typing_loop(user.telegram_id)
+
+    async def _handle_inbound_edit(self, msg: InboundMessage):
+        """Process an edit from TG → edit MM post."""
+        user = self.config.get_user_by_tg_id(msg.user_id)
+        if not user:
+            return
+        mm_id = self._lookup_mm(msg.platform_msg_id)
+        if not mm_id or not msg.text:
+            return
+        result = await self.mm.edit_post(user.mm_token, mm_id, msg.text)
+        if result.get("id"):
+            self._mark_our_post(result["id"])
+
+    async def _handle_inbound_reaction(self, msg: InboundMessage):
+        """Process a reaction from TG → add/remove on MM."""
+        user = self.config.get_user_by_tg_id(msg.user_id)
+        if not user:
+            return
+        mm_id = self._lookup_mm(msg.reaction_msg_id)
+        if not mm_id:
+            return
+
+        for emoji in (msg.reaction_added or []):
+            mm_name = unicode_to_mm(emoji)
+            if mm_name:
+                await self.mm.add_reaction(user.mm_token, user.mm_user_id, mm_id, mm_name)
+
+        for emoji in (msg.reaction_removed or []):
+            mm_name = unicode_to_mm(emoji)
+            if mm_name:
+                await self.mm.remove_reaction(user.mm_token, user.mm_user_id, mm_id, mm_name)
+
+    # --- WebSocket handlers (MM → TG) ---
+
+    async def _handle_ws_post(self, post: dict):
+        channel_id = post.get("channel_id", "")
+        post_id = post.get("id", "")
+        user_id = post.get("user_id", "")
+
+        if channel_id not in self._dm_to_user:
+            return
+        if post_id in self._our_post_ids:
+            return
+
+        user = self._dm_to_user[channel_id]
+        if user_id == user.mm_user_id:
+            return
+
+        self.adapter.stop_typing_loop(user.telegram_id)
+
+        text = post.get("message", "")
+        sent_id = None
+        if text:
+            self._stats["mm_to_tg"] += 1
+            sent_id = await self.adapter.send_message(
+                user.telegram_id, OutboundMessage(text=text)
+            )
+
+        file_ids_raw = post.get("file_ids")
+        file_ids_list = file_ids_raw if isinstance(file_ids_raw, list) else []
+        for fid in file_ids_list:
+            try:
+                await self._relay_mm_file(user, fid)
+            except Exception as e:
+                logger.error("DmBridge '%s' file relay error: %s", self.bridge.name, e)
+
+        if sent_id and post_id:
+            self._track_pair(sent_id, post_id)
+
+    async def _relay_mm_file(self, user: UserMapping, file_id: str):
+        """Download MM file and send via adapter."""
+        token = user.mm_token
+        file_info = await self.mm.get_file_info(token, file_id)
+        if not file_info:
+            return
+
+        filename = file_info.get("name", "file")
+        mime = file_info.get("mime_type", "application/octet-stream")
+        size = file_info.get("size", 0)
+        ext = file_info.get("extension", "")
+
+        suffix = f".{ext}" if ext else Path(filename).suffix or ".bin"
+        local_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                local_path = tmp.name
+            if not await self.mm.download_file(token, file_id, local_path):
+                return
+
+            await self.adapter.send_message(
+                user.telegram_id,
+                OutboundMessage(
+                    file_path=local_path,
+                    file_name=filename,
+                    file_mime=mime,
+                    file_size=size,
+                ),
+            )
+        finally:
+            if local_path:
+                try:
+                    Path(local_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    async def _handle_ws_edit(self, post: dict):
+        channel_id = post.get("channel_id", "")
+        post_id = post.get("id", "")
+        user_id = post.get("user_id", "")
+
+        if channel_id not in self._dm_to_user:
+            return
+        if post_id in self._our_post_ids:
+            return
+
+        user = self._dm_to_user[channel_id]
+        if user_id == user.mm_user_id:
+            return
+
+        platform_id = self._lookup_platform(post_id)
+        if not platform_id:
+            return
+
+        new_text = post.get("message", "")
+        if new_text:
+            await self.adapter.edit_message(user.telegram_id, platform_id, new_text)
+
+    async def _handle_ws_delete(self, post: dict):
+        channel_id = post.get("channel_id", "")
+        post_id = post.get("id", "")
+        user_id = post.get("user_id", "")
+
+        if channel_id not in self._dm_to_user:
+            return
+
+        user = self._dm_to_user[channel_id]
+        if user_id == user.mm_user_id:
+            return
+
+        platform_id = self._lookup_platform(post_id)
+        if not platform_id:
+            return
+
+        await self.adapter.delete_message(user.telegram_id, platform_id)
+        self._mm_to_tg.pop(post_id, None)
+        self._tg_to_mm.pop(platform_id, None)
+
+    async def _handle_ws_reaction_added(self, reaction: dict):
+        post_id = reaction.get("post_id", "")
+        user_id = reaction.get("user_id", "")
+        emoji_name = reaction.get("emoji_name", "")
+
+        if not post_id or not emoji_name:
+            return
+
+        platform_id = self._lookup_platform(post_id)
+        if not platform_id:
+            return
+
+        target_user = None
+        for ch_id, usr in self._dm_to_user.items():
+            if user_id != usr.mm_user_id and self._store.has_tg(platform_id):
+                target_user = usr
+                break
+        if not target_user:
+            return
+
+        tg_emoji = mm_to_unicode(emoji_name)
+        if tg_emoji:
+            await self.adapter.set_reaction(target_user.telegram_id, platform_id, tg_emoji)
+
+    async def _handle_ws_reaction_removed(self, reaction: dict):
+        post_id = reaction.get("post_id", "")
+        user_id = reaction.get("user_id", "")
+
+        if not post_id:
+            return
+
+        platform_id = self._lookup_platform(post_id)
+        if not platform_id:
+            return
+
+        target_user = None
+        for ch_id, usr in self._dm_to_user.items():
+            if user_id != usr.mm_user_id and self._store.has_tg(platform_id):
+                target_user = usr
+                break
+        if not target_user:
+            return
+
+        await self.adapter.clear_reactions(target_user.telegram_id, platform_id)
+
+    async def _handle_ws_typing(self, typing_info: dict):
+        channel_id = typing_info.get("channel_id", "")
+        user_id = typing_info.get("user_id", "")
+
+        if channel_id not in self._dm_to_user:
+            return
+
+        user = self._dm_to_user[channel_id]
+        if user_id == user.mm_user_id:
+            return
+
+        if hasattr(self.adapter, 'start_typing_loop'):
+            self.adapter.start_typing_loop(user.telegram_id)
+
+    async def _retry_mm_post(self, user, channel_id, text, file_ids, max_retries=3) -> dict:
+        delay = 1.0
+        last_error = {}
+        for attempt in range(max_retries):
+            result = await self.mm.post_message(user.mm_token, channel_id, text, file_ids)
+            if result.get("id"):
+                return result
+            last_error = result
+            if attempt == max_retries - 1:
+                logger.error(
+                    "DmBridge '%s' MM post failed after %d retries: %s",
+                    self.bridge.name, max_retries, last_error,
+                )
+                self._stats["errors"] += 1
                 await self.adapter.send_message(
                     user.telegram_id,
                     OutboundMessage(text=f"⚠️ Mensaje no entregado: {last_error.get('message', 'error')}"),

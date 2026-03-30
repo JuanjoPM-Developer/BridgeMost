@@ -22,7 +22,8 @@ class HealthServer:
             "last_mm_msg": 0.0,
         }
         self._runner: web.AppRunner | None = None
-        self.store_count_fn = None  # Set by bridge to report persistent mapping count
+        self.store_count_fn = None   # Set by core to report persistent mapping count
+        self.dm_bridges_fn = None    # Set by __main__ to report DM relay stats
 
     def record_tg_to_mm(self):
         self._stats["tg_to_mm"] += 1
@@ -59,6 +60,7 @@ class HealthServer:
             "store": {
                 "persistent_mappings": self.store_count_fn() if self.store_count_fn else None,
             },
+            "dm_bridges": self.dm_bridges_fn() if self.dm_bridges_fn else [],
         })
 
     async def start(self):

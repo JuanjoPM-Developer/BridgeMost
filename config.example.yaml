@@ -91,6 +91,30 @@ users:
       #   mm_dm_channel: ""
       #   default: false
 
+# ─── DM Bridges (optional) ─────────────────────
+# DM Bridge mode: instead of switching bots with /bot, give each MM bot its
+# own dedicated Telegram bot. Users DM that TG bot directly — messages bridge
+# transparently to the matching MM bot DM channel, bidirectionally.
+#
+# Each entry needs its own TG bot (create via @BotFather → /newbot).
+# Users and tokens are inherited from the `users` section above.
+#
+# dm_bridges:
+#   - name: "apex"
+#     # Friendly name — used in logs and for the SQLite store file (dm_apex.db)
+#
+#     tg_bot_token: "YOUR_DEDICATED_TG_BOT_TOKEN"
+#     # Token for the bot dedicated to this MM bot
+#     # Create a new bot in @BotFather for each DM bridge
+#
+#     mm_bot_id: "mm_bot_user_id_here"
+#     # Mattermost user ID of the target bot (26-char alphanumeric)
+#     # DM channel between the user and this bot is auto-discovered at startup
+#
+#   - name: "jarvis"
+#     tg_bot_token: "ANOTHER_DEDICATED_TG_BOT_TOKEN"
+#     mm_bot_id: "another_mm_bot_user_id_here"
+
 # ─── Health Check (optional) ───────────────────
 health:
   port: 9191

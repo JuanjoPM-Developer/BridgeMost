@@ -32,6 +32,14 @@ class UserMapping:
 
 
 @dataclass
+class DmBridge:
+    """Configuration for a dedicated DM bridge (one TG bot ↔ one MM bot)."""
+    tg_bot_token: str  # Telegram bot token for this bridge's dedicated bot
+    mm_bot_id: str     # MM user ID of the target bot
+    name: str          # Friendly name (used in logs and DB filenames)
+
+
+@dataclass
 class Config:
     """BridgeMost configuration."""
     # Adapter selection (auto-detected from config sections)
@@ -53,6 +61,9 @@ class Config:
 
     # User mappings
     users: list[UserMapping] = field(default_factory=list)
+
+    # DM bridges (optional) — each entry is a dedicated TG bot ↔ MM bot bridge
+    dm_bridges: list[DmBridge] = field(default_factory=list)
 
     # Logging
     log_level: str = "INFO"
@@ -193,6 +204,14 @@ def load_config(path: str | Path | None = None) -> Config:
             mapping.active_bot = "default"
 
         cfg.users.append(mapping)
+
+    # DM bridges
+    for dm in raw.get("dm_bridges", []):
+        cfg.dm_bridges.append(DmBridge(
+            tg_bot_token=dm["tg_bot_token"],
+            mm_bot_id=dm["mm_bot_id"],
+            name=dm.get("name", dm["mm_bot_id"][:8]),
+        ))
 
     # Logging
     log = raw.get("logging", {})

@@ -6,7 +6,7 @@ import signal
 import sys
 
 from .config import load_config
-from .core import BridgeMostCore
+from .core import BridgeMostCore, DmBridgeRelay
 
 
 def setup_logging(level: str, log_file: str = ""):
@@ -45,7 +45,10 @@ def main():
 
     from . import __version__
     logger.info("BridgeMost v%s — Multi-Platform ↔ Mattermost Bridge", __version__)
-    logger.info("Adapter: %s | Users: %d", config.adapter, len(config.users))
+    logger.info(
+        "Adapter: %s | Users: %d | DM bridges: %d",
+        config.adapter, len(config.users), len(config.dm_bridges),
+    )
 
     # Build the appropriate adapter
     if config.adapter == "googlechat":
@@ -71,18 +74,28 @@ def main():
 
     core = BridgeMostCore(config, adapter)
 
+    # Build DM bridge relays
+    dm_relays = [DmBridgeRelay(config, bridge) for bridge in config.dm_bridges]
+
+    # Wire DM relay stats into the health endpoint
+    if dm_relays:
+        core.health.dm_bridges_fn = lambda: [r.stats_snapshot() for r in dm_relays]
+
     # Graceful shutdown
     loop = asyncio.new_event_loop()
 
     def shutdown_handler(sig, frame):
         logger.info("Received %s, shutting down...", signal.Signals(sig).name)
         core._running = False
+        for relay in dm_relays:
+            relay._running = False
 
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
     try:
-        loop.run_until_complete(core.start())
+        coros = [core.start()] + [r.start() for r in dm_relays]
+        loop.run_until_complete(asyncio.gather(*coros))
     except KeyboardInterrupt:
         logger.info("Interrupted, shutting down...")
     finally:
