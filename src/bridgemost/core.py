@@ -486,6 +486,7 @@ class BridgeMostCore:
                     pass
 
     async def _handle_ws_edit(self, post: dict):
+        import asyncio
         channel_id = post.get("channel_id", "")
         post_id = post.get("id", "")
         user_id = post.get("user_id", "")
@@ -506,8 +507,27 @@ class BridgeMostCore:
             return
 
         new_text = post.get("message", "")
-        if new_text:
-            await self.adapter.edit_message(user.telegram_id, platform_id, new_text)
+        if not new_text:
+            return
+
+        # Debounce: buffer rapid edits (streaming bots) to avoid TG flood control
+        if not hasattr(self, "_edit_debounce"):
+            self._edit_debounce = {}
+            self._edit_pending = {}
+        self._edit_pending[post_id] = (new_text, user, platform_id)
+        prev_task = self._edit_debounce.get(post_id)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+
+        async def _flush_edit():
+            await asyncio.sleep(2.0)
+            item = self._edit_pending.pop(post_id, None)
+            self._edit_debounce.pop(post_id, None)
+            if item:
+                text, usr, pid = item
+                await self.adapter.edit_message(usr.telegram_id, pid, text)
+
+        self._edit_debounce[post_id] = asyncio.ensure_future(_flush_edit())
 
     async def _handle_ws_delete(self, post: dict):
         channel_id = post.get("channel_id", "")
@@ -658,6 +678,11 @@ class DmBridgeRelay:
                 model=config.whisper_model,
                 language=config.whisper_language,
             )
+
+        # Edit debounce: post_id → asyncio.Task (delays TG edit by 2s)
+        self._edit_debounce: dict[str, object] = {}
+        self._edit_pending: dict[str, str] = {}  # post_id → latest text
+        self._edit_debounce_secs = 2.0
 
         # Stats for health reporting
         self._stats = {"tg_to_mm": 0, "mm_to_tg": 0, "errors": 0}
@@ -981,6 +1006,7 @@ class DmBridgeRelay:
                     pass
 
     async def _handle_ws_edit(self, post: dict):
+        import asyncio
         channel_id = post.get("channel_id", "")
         post_id = post.get("id", "")
         user_id = post.get("user_id", "")
@@ -999,8 +1025,23 @@ class DmBridgeRelay:
             return
 
         new_text = post.get("message", "")
-        if new_text:
-            await self.adapter.edit_message(user.telegram_id, platform_id, new_text)
+        if not new_text:
+            return
+
+        # Debounce: buffer rapid edits (streaming bots) to avoid TG flood control
+        self._edit_pending[post_id] = new_text
+        prev_task = self._edit_debounce.get(post_id)
+        if prev_task and not prev_task.done():
+            prev_task.cancel()
+
+        async def _flush_edit():
+            await asyncio.sleep(self._edit_debounce_secs)
+            text = self._edit_pending.pop(post_id, None)
+            self._edit_debounce.pop(post_id, None)
+            if text:
+                await self.adapter.edit_message(user.telegram_id, platform_id, text)
+
+        self._edit_debounce[post_id] = asyncio.ensure_future(_flush_edit())
 
     async def _handle_ws_delete(self, post: dict):
         channel_id = post.get("channel_id", "")
