@@ -346,10 +346,16 @@ class BridgeMostCore:
     # --- Commands from adapter ---
 
     async def _handle_command(self, cmd: str, args: list[str], user_id) -> str | None:
-        """Handle /bot, /bots, /status commands. Returns reply text."""
+        """Handle BridgeMost local commands from Telegram. Returns reply text."""
         user = self.config.get_user_by_tg_id(user_id)
         if not user:
             return None
+
+        if cmd == "bridge":
+            return (
+                "🌉 Usa `/bridge bot`, `/bridge bots` o `/bridge status` para los controles locales.\n"
+                "Las demás slash commands se reenvían directamente a Hermes."
+            )
 
         if cmd == "bot":
             if not args:
@@ -835,7 +841,13 @@ class DmBridgeRelay:
     # --- Commands (DM bridges are fixed-target; commands are no-ops) ---
 
     async def _handle_command(self, cmd: str, args: list[str], user_id) -> str | None:
-        """DM bridges have no bot-switching; inform the user."""
+        """Handle BridgeMost-local commands for dedicated DM bridges."""
+        if cmd == "bridge":
+            return (
+                f"🌉 DM bridge *{self.bridge.name}*\n"
+                "Usa `/bridge help` para ver los controles locales.\n"
+                "Las demás slash commands se envían al bot Hermes conectado."
+            )
         return f"ℹ️ DM bridge *{self.bridge.name}* — fixed target, no commands needed."
 
     # --- Inbound (TG → MM) ---

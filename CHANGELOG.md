@@ -2,6 +2,19 @@
 
 All notable changes to BridgeMost are documented here.
 
+## v2.2.4 (2026-04-08)
+
+### Added
+- **Telegram slash-command passthrough** — generic slash commands now cross BridgeMost unchanged
+  - `/new`, `/model`, `/help`, and other Hermes-native commands are forwarded verbatim to Mattermost bots
+  - Telegram `@botname` suffixes are normalized away before forwarding upstream
+  - BridgeMost local controls now live under `/bridge ...` to avoid namespace collisions with Hermes
+
+### Changed
+- `/status` is reserved for Hermes passthrough; local bridge status moved to `/bridge status`
+- Main relay and dedicated DM bridges now advertise the `/bridge` namespace explicitly
+- Version bumped to `2.2.4`
+
 ## v2.2.3 (2026-04-08)
 
 ### Fixed

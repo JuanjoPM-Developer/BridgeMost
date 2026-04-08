@@ -1,7 +1,7 @@
 """Telegram adapter for BridgeMost.
 
 Handles all Telegram-specific logic: bot polling, message sending,
-media upload/download, reactions, typing indicators, /bot command.
+media upload/download, reactions, typing indicators, and slash-command passthrough.
 """
 
 import asyncio
@@ -25,6 +25,10 @@ logger = logging.getLogger("bridgemost.adapter.telegram")
 
 # Telegram message length limit
 TG_MAX_LENGTH = 4096
+
+# BridgeMost local commands live under their own namespace so generic
+# slash commands can pass through transparently to Hermes upstream.
+BRIDGEMOST_CONTROL_COMMAND = "bridge"
 
 
 def split_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
@@ -76,10 +80,16 @@ class TelegramAdapter(BaseAdapter):
         self._app = ApplicationBuilder().token(self._bot_token).build()
         self._bot = self._app.bot
 
-        # Commands
+        # Local BridgeMost commands
+        self._app.add_handler(CommandHandler(BRIDGEMOST_CONTROL_COMMAND, self._cmd_bridge))
         self._app.add_handler(CommandHandler("bot", self._cmd_bot))
         self._app.add_handler(CommandHandler("bots", self._cmd_bots))
-        self._app.add_handler(CommandHandler("status", self._cmd_status))
+
+        # Unknown slash commands must pass through to Mattermost/Hermes.
+        self._app.add_handler(MessageHandler(
+            filters.COMMAND & ~filters.StatusUpdate.ALL,
+            self._on_tg_passthrough_command,
+        ))
 
         # Messages
         self._app.add_handler(MessageHandler(
@@ -226,6 +236,43 @@ class TelegramAdapter(BaseAdapter):
         inbound.text = msg.text or msg.caption or ""
         await self._on_message(inbound)
 
+    @staticmethod
+    def _normalize_command_text(text: str) -> str:
+        """Normalize Telegram command syntax before forwarding upstream."""
+        if not text or not text.startswith("/"):
+            return text
+        parts = text.split(maxsplit=1)
+        command = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        if "@" in command:
+            command = command.split("@", 1)[0]
+        return f"{command} {rest}".strip()
+
+    async def _on_tg_passthrough_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Forward unknown slash commands verbatim to Mattermost/Hermes."""
+        msg = update.effective_message
+        if not msg or not update.effective_user:
+            return
+        if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._on_message:
+            return
+
+        text = self._normalize_command_text(msg.text or msg.caption or "")
+        if not text:
+            return
+
+        command_name = text.split(maxsplit=1)[0].lstrip("/").lower()
+        if command_name in {BRIDGEMOST_CONTROL_COMMAND, "bot", "bots"}:
+            return
+
+        inbound = InboundMessage(
+            platform_msg_id=msg.message_id,
+            user_id=update.effective_user.id,
+            text=text,
+        )
+        await self._on_message(inbound)
+
     async def _on_tg_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle edited TG message."""
         msg = update.edited_message
@@ -275,6 +322,42 @@ class TelegramAdapter(BaseAdapter):
 
     # --- Commands ---
 
+    @staticmethod
+    def _bridge_help_text() -> str:
+        return (
+            "🌉 *BridgeMost*\n\n"
+            "Comandos locales del bridge:\n"
+            "- `/bridge bot` — listar bot activo y disponibles\n"
+            "- `/bridge bot <nombre>` — cambiar el bot activo\n"
+            "- `/bridge bots` — ver estado de bots\n"
+            "- `/bridge status` — ver estado local del bridge\n\n"
+            "Todas las demás slash commands (`/new`, `/model`, `/help`, `/status`, ...) "
+            "se reenvían a Hermes."
+        )
+
+    async def _cmd_bridge(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._on_command or not update.effective_user or not update.effective_message:
+            return
+
+        args = context.args or []
+        if not args:
+            reply = self._bridge_help_text()
+        else:
+            subcmd = args[0].lower()
+            subargs = args[1:]
+            if subcmd in {"bot", "bots", "status"}:
+                reply = await self._on_command(subcmd, subargs, update.effective_user.id)
+            elif subcmd in {"help", "ayuda"}:
+                reply = self._bridge_help_text()
+            else:
+                reply = (
+                    f"❌ Subcomando desconocido: `{subcmd}`\n\n"
+                    f"{self._bridge_help_text()}"
+                )
+
+        if reply:
+            await update.effective_message.reply_text(reply, parse_mode="Markdown")
+
     async def _cmd_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._on_command or not update.effective_user or not update.effective_message:
             return
@@ -286,13 +369,6 @@ class TelegramAdapter(BaseAdapter):
         if not self._on_command or not update.effective_user or not update.effective_message:
             return
         reply = await self._on_command("bots", [], update.effective_user.id)
-        if reply:
-            await update.effective_message.reply_text(reply, parse_mode="Markdown")
-
-    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._on_command or not update.effective_user or not update.effective_message:
-            return
-        reply = await self._on_command("status", [], update.effective_user.id)
         if reply:
             await update.effective_message.reply_text(reply, parse_mode="Markdown")
 

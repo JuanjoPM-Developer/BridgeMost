@@ -27,8 +27,9 @@ Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost pos
 | 🪪 Transparent identity | Posts as your real MM user (avatar, name, everything) |
 | 📁 Full media | Photos, documents, audio, video, voice — bidirectional |
 | 🎤 Voice-to-text | Voice messages auto-transcribed via Whisper API |
-| 🤖 Multi-bot routing | Talk to multiple MM bots; switch with `/bot name` |
+| 🤖 Multi-bot routing | Talk to multiple MM bots; switch with `/bridge bot <name>` |
 | 📲 DM Bridge mode | Give each MM bot its own dedicated TG bot — DM it directly (v2.2.0) |
+| /️⃣ Hermes slash passthrough | `/new`, `/model`, `/help`, etc. cross Telegram → Mattermost unchanged (v2.2.4) |
 | ⚡ Real-time WebSocket | Responses arrive instantly (no polling) |
 | ✏️ Edit & delete sync | Edits and deletes stay in sync both ways |
 | 😀 Reactions | Emoji reactions synced bidirectionally |
@@ -41,6 +42,30 @@ Unlike Matterbridge or webhooks that post with `[User]` prefixes, BridgeMost pos
 | 🐳 Docker | Multi-stage image, ~55 MB |
 
 ~55 MB RAM · ~250 ms latency · asyncio-based · Python 3.11+
+
+### Hermes slash commands over Telegram
+
+BridgeMost now preserves generic slash commands when the upstream Mattermost bot is Hermes.
+That means commands like:
+
+- `/new`
+- `/model`
+- `/help`
+- `/commands`
+- `/reasoning`
+
+arrive in Mattermost exactly as typed, instead of being swallowed by Telegram-side command handlers.
+
+### BridgeMost local command namespace
+
+To avoid collisions with Hermes, BridgeMost keeps its own local controls under `/bridge`:
+
+- `/bridge bot` — list bots or switch the active relay target
+- `/bridge bots` — inspect available bot routes
+- `/bridge status` — inspect bridge-local status
+- `/bridge help` — show the local command help
+
+Legacy `/bot` and `/bots` aliases still work in Telegram for compatibility, but `/status` is now reserved for Hermes passthrough.
 
 > **Multi-user ready:** Multiple people can use the same BridgeMost instance — each with their own chat account, Mattermost identity, and bot routing. Add users to `config.yaml` and they appear as themselves in Mattermost. No shared accounts, no impersonation.
 
