@@ -26,9 +26,18 @@ async def _run_dm_bridge_relay(relay: DmBridgeRelay):
 
 def setup_logging(level: str, log_file: str = ""):
     """Configure logging."""
+    # In production a full disk can make FileHandler.flush() raise repeatedly.
+    # Keep journald/stdout alive and suppress logging's own internal tracebacks.
+    logging.raiseExceptions = False
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file:
-        handlers.append(logging.FileHandler(log_file))
+        try:
+            handlers.append(logging.FileHandler(log_file))
+        except OSError as exc:
+            print(
+                f"WARNING: BridgeMost file logging disabled for {log_file}: {exc}",
+                file=sys.stderr,
+            )
 
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -82,6 +91,7 @@ def main():
         adapter = TelegramAdapter(
             bot_token=config.tg_bot_token,
             allowed_user_ids=allowed_ids,
+            polling_timeout=config.tg_timeout,
         )
     else:
         logger.critical("Unknown adapter: %s", config.adapter)

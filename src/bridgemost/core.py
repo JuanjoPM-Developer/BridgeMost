@@ -57,6 +57,31 @@ def describe_mm_validation_failure(error: dict | None) -> tuple[str, str]:
     )
 
 
+def should_notify_validation_failure(
+    failure_kind: str,
+    consecutive_failures: int,
+    *,
+    availability_threshold: int = 2,
+    availability_repeat_every: int = 6,
+) -> bool:
+    """Return whether a PAT validation failure should notify the user.
+
+    Auth failures require immediate action. Availability failures are noisy during
+    Mattermost restarts/outages, so alert after confirmation and then periodically.
+    With the default 5-minute health loop this means: first availability alert at
+    ~10 minutes, then every ~30 minutes while still failing.
+    """
+    if failure_kind == "auth":
+        return True
+    if consecutive_failures <= 0:
+        return False
+    if consecutive_failures == availability_threshold:
+        return True
+    if consecutive_failures > availability_threshold and availability_repeat_every > 0:
+        return (consecutive_failures - availability_threshold) % availability_repeat_every == 0
+    return False
+
+
 class BridgeMostCore(TelegramPresentationMixin):
     """Platform-agnostic relay engine.
 
@@ -93,6 +118,9 @@ class BridgeMostCore(TelegramPresentationMixin):
 
         # Health server
         self.health = HealthServer(port=config.health_port)
+
+        # PAT validation notification debounce: telegram_id -> consecutive failures
+        self._validation_failure_counts: dict[int, int] = {}
 
         # Voice-to-text
         self.whisper: WhisperClient | None = None
@@ -249,23 +277,31 @@ class BridgeMostCore(TelegramPresentationMixin):
                     counter = 0
                     for user in self.config.users:
                         info = await self.mm.validate_token(user.mm_token)
-                        if not info:
-                            failure = self.mm.last_validate_error
-                            failure_kind, notice = describe_mm_validation_failure(failure)
-                            logger.error(
-                                "Mattermost token validation failed for %s (%s): %s",
-                                user.telegram_name,
-                                failure_kind,
-                                failure,
+                        if info:
+                            self._validation_failure_counts[user.telegram_id] = 0
+                            continue
+
+                        failure = self.mm.last_validate_error
+                        failure_kind, notice = describe_mm_validation_failure(failure)
+                        count = self._validation_failure_counts.get(user.telegram_id, 0) + 1
+                        self._validation_failure_counts[user.telegram_id] = count
+                        logger.error(
+                            "Mattermost token validation failed for %s (%s, consecutive=%d): %s",
+                            user.telegram_name,
+                            failure_kind,
+                            count,
+                            failure,
+                        )
+                        self.health.record_error()
+                        if not should_notify_validation_failure(failure_kind, count):
+                            continue
+                        if hasattr(self.adapter, "send_raw_text"):
+                            await self.adapter.send_raw_text(user.telegram_id, notice)
+                        else:
+                            await self.adapter.send_message(
+                                user.telegram_id,
+                                OutboundMessage(text=notice),
                             )
-                            self.health.record_error()
-                            if hasattr(self.adapter, "send_raw_text"):
-                                await self.adapter.send_raw_text(user.telegram_id, notice)
-                            else:
-                                await self.adapter.send_message(
-                                    user.telegram_id,
-                                    OutboundMessage(text=notice),
-                                )
         finally:
             self._running = False
             if self._ws:
@@ -715,6 +751,7 @@ class DmBridgeRelay(TelegramPresentationMixin):
         self.adapter = TelegramAdapter(
             bot_token=bridge.tg_bot_token,
             allowed_user_ids=allowed_ids,
+            polling_timeout=config.tg_timeout,
         )
         self.mm = MattermostClient(config.mm_url)
 

@@ -63,9 +63,10 @@ def split_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
 class TelegramAdapter(BaseAdapter):
     """Telegram adapter using python-telegram-bot."""
 
-    def __init__(self, bot_token: str, allowed_user_ids: list[int] | None = None):
+    def __init__(self, bot_token: str, allowed_user_ids: list[int] | None = None, polling_timeout: int = 30):
         self._bot_token = bot_token
         self._allowed_users = set(allowed_user_ids) if allowed_user_ids else None
+        self._polling_timeout = polling_timeout
         self._app = None
         self._bot = None
         # Typing tasks per user
@@ -112,7 +113,11 @@ class TelegramAdapter(BaseAdapter):
 
         await self._app.initialize()
         await self._app.start()
-        await self._app.updater.start_polling(drop_pending_updates=True, poll_interval=0.5)
+        await self._app.updater.start_polling(
+            drop_pending_updates=True,
+            poll_interval=0.5,
+            timeout=self._polling_timeout,
+        )
         logger.info("Telegram adapter started")
 
     async def _on_ptb_error(self, update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -153,6 +158,22 @@ class TelegramAdapter(BaseAdapter):
             return True
         return tg_user_id in self._allowed_users
 
+    @staticmethod
+    def _is_secure_update(update: Update, msg) -> bool:
+        """Reject Telegram updates outside the owner-only private-DM model."""
+        chat = getattr(update, "effective_chat", None)
+        if chat and getattr(chat, "type", None) != "private":
+            return False
+        if getattr(msg, "sender_chat", None):
+            return False
+        if getattr(msg, "forward_origin", None):
+            return False
+        if getattr(msg, "forward_from", None) or getattr(msg, "forward_from_chat", None):
+            return False
+        if getattr(msg, "forward_date", None):
+            return False
+        return True
+
     async def _rate_wait(self):
         import time
         now = time.monotonic()
@@ -171,6 +192,8 @@ class TelegramAdapter(BaseAdapter):
         if not msg or not update.effective_user:
             return
         if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._is_secure_update(update, msg):
             return
         if not self._on_message:
             return
@@ -281,6 +304,8 @@ class TelegramAdapter(BaseAdapter):
             return
         if not self._is_allowed(update.effective_user.id):
             return
+        if not self._is_secure_update(update, msg):
+            return
         if not self._on_message:
             return
 
@@ -308,6 +333,8 @@ class TelegramAdapter(BaseAdapter):
         if not msg or not update.effective_user:
             return
         if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._is_secure_update(update, msg):
             return
         if not self._on_edit:
             return
@@ -373,6 +400,10 @@ class TelegramAdapter(BaseAdapter):
     async def _cmd_bridge(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._on_command or not update.effective_user or not update.effective_message:
             return
+        if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._is_secure_update(update, update.effective_message):
+            return
 
         args = context.args or []
         if not args:
@@ -396,12 +427,20 @@ class TelegramAdapter(BaseAdapter):
     async def _cmd_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._on_command or not update.effective_user or not update.effective_message:
             return
+        if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._is_secure_update(update, update.effective_message):
+            return
         reply = await self._on_command("bot", context.args or [], update.effective_user.id)
         if reply:
             await update.effective_message.reply_text(reply, parse_mode="Markdown")
 
     async def _cmd_bots(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._on_command or not update.effective_user or not update.effective_message:
+            return
+        if not self._is_allowed(update.effective_user.id):
+            return
+        if not self._is_secure_update(update, update.effective_message):
             return
         reply = await self._on_command("bots", [], update.effective_user.id)
         if reply:

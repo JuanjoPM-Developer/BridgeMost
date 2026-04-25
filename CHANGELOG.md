@@ -2,6 +2,16 @@
 
 All notable changes to BridgeMost are documented here.
 
+## v2.2.7 (2026-04-25)
+
+### Fixed
+- **Telegram polling timeout wiring** — `polling.telegram_timeout` is now passed into PTB `start_polling(timeout=...)` for main relay and DM bridges instead of being dead config.
+- **Owner-only Telegram hardening** — Telegram updates outside private DMs, forwarded messages, and sender-chat messages are rejected before relay/command handling.
+- **Clean-mode placeholder fallback** — if Telegram cannot edit/stream a placeholder because the message disappeared, BridgeMost sends the final answer as a new message and tracks that new ID instead of losing the reply.
+- **Mattermost availability alert debounce** — transient validation failures now require confirmation before notifying Telegram and repeat periodically instead of spamming every health cycle.
+- **Disk-full logging resilience** — logging internal tracebacks are suppressed and unusable file handlers are skipped so ENOSPC does not flood journald while stdout logging remains available.
+- **Mattermost file upload resilience** — upload transport failures and non-JSON error bodies are contained and logged instead of bubbling out of Telegram handlers.
+
 ## v2.2.6 (2026-04-23)
 
 ### Fixed

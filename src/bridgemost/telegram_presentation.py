@@ -201,19 +201,26 @@ class TelegramPresentationMixin:
         state.placeholder_msg_id = None
 
         if placeholder_id:
+            edit_ok = False
             stream_fn = getattr(self.adapter, "stream_edit_message", None)
             if callable(stream_fn) and getattr(cfg, "stream_final_response", True):
-                await stream_fn(
+                edit_ok = bool(await stream_fn(
                     user_id,
                     placeholder_id,
                     text,
                     chunk_size=int(getattr(cfg, "stream_chunk_chars", 180)),
                     interval=float(getattr(cfg, "stream_edit_interval", 0.18)),
-                )
+                ))
             else:
-                await self.adapter.edit_message(user_id, placeholder_id, text)
-            self._track_pair(placeholder_id, mm_post_id)
-            return placeholder_id
+                edit_ok = bool(await self.adapter.edit_message(user_id, placeholder_id, text))
+            if edit_ok:
+                self._track_pair(placeholder_id, mm_post_id)
+                return placeholder_id
+
+            sent_id = await self.adapter.send_message(user_id, OutboundMessage(text=text))
+            if sent_id:
+                self._track_pair(sent_id, mm_post_id)
+            return sent_id
 
         sent_id = await self.adapter.send_message(user_id, OutboundMessage(text=text))
         if sent_id:

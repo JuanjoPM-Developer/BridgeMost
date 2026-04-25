@@ -87,32 +87,39 @@ class MattermostClient:
     ) -> str | None:
         """Upload a file and return the file_id."""
         session = await self._get_session()
-        form = aiohttp.FormData()
-        form.add_field("channel_id", channel_id)
+        try:
+            form = aiohttp.FormData()
+            form.add_field("channel_id", channel_id)
 
-        # FIX #1: Proper file handle management with context manager
-        with open(file_path, "rb") as fh:
-            form.add_field(
-                "files",
-                fh,
-                filename=filename,
-            )
+            # Proper file handle management with context manager
+            with open(file_path, "rb") as fh:
+                form.add_field(
+                    "files",
+                    fh,
+                    filename=filename,
+                )
 
-            headers = {"Authorization": f"Bearer {token}"}
-            async with session.post(
-                f"{self.base_url}/api/v4/files",
-                data=form,
-                headers=headers,
-            ) as resp:
-                data = await resp.json()
-                if resp.status in (200, 201):
-                    file_infos = data.get("file_infos", [])
-                    if file_infos:
-                        fid = file_infos[0]["id"]
-                        logger.debug("MM file uploaded: %s → %s", filename, fid)
-                        return fid
-                logger.error("MM upload failed (%d): %s", resp.status, data)
-                return None
+                headers = {"Authorization": f"Bearer {token}"}
+                async with session.post(
+                    f"{self.base_url}/api/v4/files",
+                    data=form,
+                    headers=headers,
+                ) as resp:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = {"message": await resp.text()}
+                    if resp.status in (200, 201):
+                        file_infos = data.get("file_infos", [])
+                        if file_infos:
+                            fid = file_infos[0]["id"]
+                            logger.debug("MM file uploaded: %s → %s", filename, fid)
+                            return fid
+                    logger.error("MM upload failed (%d): %s", resp.status, data)
+                    return None
+        except Exception as e:
+            logger.error("MM upload exception: %s", e)
+            return None
 
     async def get_dm_channel(self, token: str, user_id: str, other_id: str) -> str | None:
         """Get or create a DM channel between two users.

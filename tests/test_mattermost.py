@@ -1,6 +1,7 @@
 """Tests for Mattermost client — non-network tests only."""
 
 import asyncio
+from pathlib import Path
 
 from bridgemost.mattermost import MattermostClient
 
@@ -18,6 +19,17 @@ class FakeResponse:
 
     async def json(self):
         return self._payload
+
+    async def text(self):
+        return str(self._payload)
+
+
+class BadJsonResponse(FakeResponse):
+    async def json(self):
+        raise ValueError("not json")
+
+    async def text(self):
+        return "plain error body"
 
 
 class FailingPostContext:
@@ -83,3 +95,25 @@ def test_post_message_exception_returns_structured_error_instead_of_raising():
 
     assert result["error_type"] == "TimeoutError"
     assert "mattermost timeout" in result["message"]
+
+
+def test_post_message_non_json_error_returns_plain_body():
+    client = MattermostClient("http://localhost:8065")
+    client._session = FakeSession(post_response=BadJsonResponse(502, {}))
+
+    result = asyncio.run(client.post_message("pat-123", "channel123", "hola", None))
+
+    assert result["error_type"] == "HTTPError"
+    assert result["status_code"] == 502
+    assert result["message"] == "plain error body"
+
+
+def test_upload_file_transport_exception_returns_none(tmp_path: Path):
+    path = tmp_path / "voice.ogg"
+    path.write_bytes(b"fake audio")
+    client = MattermostClient("http://localhost:8065")
+    client._session = FakeSession(post_response=FailingPostContext(TimeoutError("upload timeout")))
+
+    result = asyncio.run(client.upload_file("pat-123", "channel123", str(path), "voice.ogg"))
+
+    assert result is None
